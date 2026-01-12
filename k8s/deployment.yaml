@@ -1,0 +1,80 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: openai-agent-service
+  namespace: backend
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: openai-agent-service
+  template:
+    metadata:
+      labels:
+        app: openai-agent-service
+    spec:
+      imagePullSecrets:
+        - name: scm-registrypullsecret
+      containers:
+        - name: openai-agent-service
+          image: smartcitymedia/scm-openai-api:0.0.5
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8091
+              name: http
+          env:
+            - name: PORT
+              value: "8091"
+            - name: TOOL_GATEWAY_BASE_URL
+              value: "https://tool-gateway.citypost.us"
+            - name: OPENAI_MODEL
+              value: "gpt-4o-mini"
+            - name: MOCK_MODE
+              value: "false"
+            - name: AUTO_CREATE_DB
+              value: "true"
+            - name: MAINTENANCE_DB
+              value: "postgres"
+            - name: CORS_ALLOWED_ORIGINS
+              value: "*"
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: openai-agent-service-secret
+                  key: database_url
+            - name: OPENAI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: openai-agent-service-secret
+                  key: openai_api_key
+            - name: TOOL_GATEWAY_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: openai-agent-service-secret
+                  key: tool_gateway_api_key
+            - name: AGENT_API_KEYS
+              valueFrom:
+                secretKeyRef:
+                  name: openai-agent-service-secret
+                  key: agent_api_keys
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 10
+            timeoutSeconds: 2
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 20
+            timeoutSeconds: 2
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi

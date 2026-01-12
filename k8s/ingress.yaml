@@ -1,0 +1,18 @@
+
+apiVersion: traefik.containo.us/v1alpha1
+kind: IngressRoute
+metadata:
+  name: openai-agent-service-metrics
+  namespace: backend
+spec:
+  entryPoints:
+    - web
+    - websecure
+  routes:
+    - match: Host(`openai-agent-service.citypost.us`)
+      kind: Rule
+      services:
+        - name: openai-agent-service
+          port: 80
+  tls:
+    secretName: traefik-cert
