@@ -268,12 +268,15 @@ func isTopPostersFromCityIntent(msgLower string) bool {
 		return false
 	}
 	if strings.Contains(s, "top") && (strings.Contains(s, "poster") || strings.Contains(s, "posters")) {
+		// Allow follow-ups like "show top posters" to be handled deterministically using the
+		// remembered city/region scope in the conversation.
 		if strings.Contains(s, "from") || strings.Contains(s, "in") || strings.Contains(s, "city") {
 			return true
 		}
 		if strings.Contains(s, "perform") {
 			return true
 		}
+		return true
 	}
 	return false
 }
@@ -290,6 +293,217 @@ func isListCampaignsIntent(msgLower string) bool {
 		return true
 	}
 	return false
+}
+
+func (c *ChatService) handlePopTodayByHost(ctx context.Context, req models.ChatRequest, onToken func(string)) (models.ChatResponse, bool, error) {
+	msgLower := strings.ToLower(req.Message)
+	if !strings.Contains(msgLower, "pop") {
+		return models.ChatResponse{}, false, nil
+	}
+	if !(strings.Contains(msgLower, "today") || strings.Contains(msgLower, "today's") || strings.Contains(msgLower, "todays") || strings.Contains(msgLower, "current_day")) {
+		return models.ChatResponse{}, false, nil
+	}
+
+	if c.Gateway == nil {
+		return models.ChatResponse{Answer: "Tool gateway is not configured."}, true, nil
+	}
+
+	conversationID := strings.TrimSpace(req.ConversationID)
+	host := ""
+	if tokens := detectHostTokens(req.Message); len(tokens) > 0 {
+		candidate := strings.ToLower(strings.TrimSpace(tokens[0]))
+		parts := strings.Split(strings.ReplaceAll(candidate, "_", "-"), "-")
+		if len(parts) >= 3 {
+			host = candidate
+		}
+	}
+
+	// If user didn't provide a host-like token, try last host or resolve display name.
+	var resolveStep *models.Step
+	if host == "" {
+		if conversationID != "" {
+			if st := c.getConversationState(conversationID); st != nil {
+				if strings.TrimSpace(st.Host) != "" {
+					host = strings.ToLower(strings.TrimSpace(st.Host))
+				}
+			}
+		}
+	}
+	if host == "" {
+		if resolved, step := c.resolveHostFromDeviceName(ctx, conversationID, req.Message); strings.TrimSpace(resolved) != "" {
+			host = strings.ToLower(strings.TrimSpace(resolved))
+			resolveStep = step
+		}
+	}
+	if host == "" {
+		return models.ChatResponse{Answer: "Please specify the device host/server id (for example: moco-brt-briggs-001) or a kiosk display name."}, true, nil
+	}
+	if conversationID != "" {
+		c.updateConversationHost(conversationID, host)
+		c.clearPending(conversationID)
+	}
+
+	// Pull today's POP rows for this host.
+	type popItem struct {
+		PosterName  string    `json:"poster_name"`
+		PosterID    string    `json:"poster_id"`
+		HostName    string    `json:"host_name"`
+		KioskName   string    `json:"kiosk_name"`
+		PosterType  string    `json:"poster_type"`
+		PopDatetime time.Time `json:"pop_datetime"`
+		KioskLat    float64   `json:"kiosk_lat"`
+		KioskLong   float64   `json:"kiosk_long"`
+		City        string    `json:"city"`
+		Region      string    `json:"region"`
+		PlayCount   int64     `json:"play_count"`
+		Value       int64     `json:"value"`
+		Type        string    `json:"type"`
+		Url         string    `json:"url"`
+	}
+	type popListResponse struct {
+		Items    []popItem `json:"items"`
+		Total    int64     `json:"total"`
+		Page     int       `json:"page"`
+		PageSize int       `json:"page_size"`
+	}
+
+	page := 1
+	pageSize := 200
+	maxPages := 10
+	steps := make([]models.Step, 0, 2)
+	items := make([]popItem, 0, 64)
+	for {
+		path := fmt.Sprintf("/pop?host_name=%s&preset=today&page=%d&page_size=%d", urlEscape(host), page, pageSize)
+		status, body, err := c.Gateway.Get(path)
+		step := models.Step{Tool: "popList", Status: status}
+		if err != nil {
+			step.Error = err.Error()
+		} else {
+			step.Body = clipString(strings.TrimSpace(string(body)), 2000)
+		}
+		steps = append(steps, step)
+		if err != nil {
+			return models.ChatResponse{Answer: "Failed to fetch POP data: " + err.Error(), Steps: steps}, true, nil
+		}
+		if status < 200 || status >= 300 {
+			return models.ChatResponse{Answer: fmt.Sprintf("Failed to fetch POP data (status %d).", status), Steps: steps}, true, nil
+		}
+		var resp popListResponse
+		if json.Unmarshal(body, &resp) != nil {
+			return models.ChatResponse{Answer: "POP list response could not be parsed.", Steps: steps}, true, nil
+		}
+		if len(resp.Items) == 0 {
+			break
+		}
+		items = append(items, resp.Items...)
+		// Stop once we are past the last page when total is available.
+		if resp.Total > 0 {
+			if int64(page*pageSize) >= resp.Total {
+				break
+			}
+		} else if len(resp.Items) < pageSize {
+			break
+		}
+		page++
+		if page > maxPages {
+			break
+		}
+	}
+	if resolveStep != nil {
+		steps = append([]models.Step{*resolveStep}, steps...)
+	}
+
+	if len(items) == 0 {
+		return models.ChatResponse{Answer: fmt.Sprintf("No POP data was found for '%s' today.", host), Steps: steps}, true, nil
+	}
+
+	// Aggregate by poster.
+	type agg struct {
+		PosterID    string
+		PosterName  string
+		PosterType  string
+		Url         string
+		PlayCount   int64
+		LastSeen    time.Time
+		KioskName   string
+		KioskLat    float64
+		KioskLong   float64
+		City        string
+		Region      string
+		HostName    string
+	}
+	byPoster := map[string]*agg{}
+	for _, it := range items {
+		key := strings.TrimSpace(it.PosterID)
+		if key == "" {
+			key = strings.TrimSpace(it.PosterName)
+		}
+		if key == "" {
+			continue
+		}
+		a := byPoster[key]
+		if a == nil {
+			a = &agg{
+				PosterID:   strings.TrimSpace(it.PosterID),
+				PosterName: strings.TrimSpace(it.PosterName),
+				PosterType: strings.TrimSpace(it.PosterType),
+				Url:        strings.TrimSpace(it.Url),
+				KioskName:  strings.TrimSpace(it.KioskName),
+				KioskLat:   it.KioskLat,
+				KioskLong:  it.KioskLong,
+				City:       strings.ToLower(strings.TrimSpace(it.City)),
+				Region:     strings.ToLower(strings.TrimSpace(it.Region)),
+				HostName:   strings.ToLower(strings.TrimSpace(it.HostName)),
+			}
+			byPoster[key] = a
+		}
+		a.PlayCount += it.PlayCount
+		if it.PopDatetime.After(a.LastSeen) {
+			a.LastSeen = it.PopDatetime
+			if strings.TrimSpace(it.Url) != "" {
+				a.Url = strings.TrimSpace(it.Url)
+			}
+			if strings.TrimSpace(it.PosterType) != "" {
+				a.PosterType = strings.TrimSpace(it.PosterType)
+			}
+		}
+		if strings.TrimSpace(a.PosterName) == "" && strings.TrimSpace(it.PosterName) != "" {
+			a.PosterName = strings.TrimSpace(it.PosterName)
+		}
+	}
+
+	rows := make([]*agg, 0, len(byPoster))
+	for _, a := range byPoster {
+		rows = append(rows, a)
+	}
+	sort.Slice(rows, func(i, j int) bool { return rows[i].PlayCount > rows[j].PlayCount })
+	if len(rows) > 10 {
+		rows = rows[:10]
+	}
+
+	first := rows[0]
+	lines := make([]string, 0, len(rows)+2)
+	lines = append(lines, fmt.Sprintf("Today's POP for '%s' (%s):", host, strings.TrimSpace(first.KioskName)))
+	for i, r := range rows {
+		name := r.PosterName
+		if strings.TrimSpace(name) == "" {
+			name = r.PosterID
+		}
+		if strings.TrimSpace(name) == "" {
+			continue
+		}
+		extra := ""
+		if strings.TrimSpace(r.PosterType) != "" {
+			extra = " (" + strings.TrimSpace(r.PosterType) + ")"
+		}
+		lines = append(lines, fmt.Sprintf("%d. %s — %d plays%s", i+1, name, r.PlayCount, extra))
+	}
+	lines = append(lines, fmt.Sprintf("Location: %.6f, %.6f | Last update: %s", first.KioskLat, first.KioskLong, first.LastSeen.UTC().Format(time.RFC3339)))
+	answer := strings.Join(lines, "\n")
+	if onToken != nil {
+		onToken(answer)
+	}
+	return models.ChatResponse{Answer: answer, Steps: steps}, true, nil
 }
 
 func (c *ChatService) chatWithToolLoop(ctx context.Context, messages []OpenAIMessage, tools []OpenAITool, toolChoice any) (string, error) {
@@ -414,6 +628,9 @@ type ChatService struct {
 	MaxToolCalls int
 	MaxToolBytes int
 
+	convMu    sync.Mutex
+	convState map[string]*conversationState
+
 	cityMu       sync.Mutex
 	cityCache    map[string]struct{}
 	cityCacheAt  time.Time
@@ -430,6 +647,438 @@ type ChatService struct {
 	projectCacheTTL     time.Duration
 
 	projectMappingsOnce sync.Once
+}
+
+type conversationState struct {
+	City           string
+	Region         string
+	Host           string
+	PendingHandler string
+	PendingMessage string
+	UpdatedAt      time.Time
+}
+
+func (c *ChatService) ensureConversationStateHydrated(ctx context.Context, ownerKey, conversationID string) {
+	id := strings.TrimSpace(conversationID)
+	if id == "" {
+		return
+	}
+	st := c.getConversationState(id)
+	if st == nil {
+		return
+	}
+	// If we already have any useful state, don't re-hydrate.
+	if strings.TrimSpace(st.City) != "" || strings.TrimSpace(st.Region) != "" || strings.TrimSpace(st.Host) != "" {
+		return
+	}
+	if c.Store == nil {
+		return
+	}
+	msgs, err := c.Store.ListMessages(ctx, ownerKey, id, 50)
+	if err != nil || len(msgs) == 0 {
+		return
+	}
+
+	// Prefer newest hints, but preserve ordering for incremental inference.
+	// We scan from oldest->newest so later messages can overwrite earlier guesses.
+	city := ""
+	region := ""
+	host := ""
+
+	// Patterns like "city 'moco'" and "region 'brt'" appear in deterministic answers.
+	cityRe := regexp.MustCompile(`(?i)city\s+'([a-z0-9_-]+)'`)
+	regionRe := regexp.MustCompile(`(?i)region\s+'([a-z0-9_-]+)'`)
+
+	for _, m := range msgs {
+		content := strings.TrimSpace(m.Content)
+		if content == "" {
+			continue
+		}
+		lower := strings.ToLower(content)
+
+		if h := detectHostTokens(content); len(h) > 0 {
+			candidate := strings.ToLower(strings.TrimSpace(h[0]))
+			parts := strings.Split(strings.ReplaceAll(candidate, "_", "-"), "-")
+			if len(parts) >= 3 {
+				host = candidate
+				// Also infer city/region from host prefix.
+				if parts[0] != "" {
+					city = parts[0]
+				}
+				if parts[1] != "" {
+					region = parts[1]
+				}
+			}
+		}
+
+		if cty := c.detectCityCode(ctx, lower); cty != "" {
+			city = cty
+		}
+		if reg := c.detectRegionCode(ctx, lower); reg != "" {
+			region = reg
+		}
+
+		if mm := cityRe.FindStringSubmatch(content); len(mm) == 2 {
+			city = strings.ToLower(strings.TrimSpace(mm[1]))
+		}
+		if mm := regionRe.FindStringSubmatch(content); len(mm) == 2 {
+			region = strings.ToLower(strings.TrimSpace(mm[1]))
+		}
+	}
+
+	if strings.TrimSpace(city) != "" {
+		st.City = strings.ToLower(strings.TrimSpace(city))
+	}
+	if strings.TrimSpace(region) != "" {
+		st.Region = strings.ToLower(strings.TrimSpace(region))
+	}
+	if strings.TrimSpace(host) != "" {
+		st.Host = strings.ToLower(strings.TrimSpace(host))
+	}
+	st.UpdatedAt = time.Now()
+}
+
+func (c *ChatService) getConversationState(conversationID string) *conversationState {
+	id := strings.TrimSpace(conversationID)
+	if id == "" {
+		return nil
+	}
+	c.convMu.Lock()
+	defer c.convMu.Unlock()
+	if c.convState == nil {
+		c.convState = map[string]*conversationState{}
+	}
+	st := c.convState[id]
+	if st == nil {
+		st = &conversationState{}
+		c.convState[id] = st
+	}
+	return st
+}
+
+func (c *ChatService) setPending(conversationID, handler, pendingMessage string) {
+	st := c.getConversationState(conversationID)
+	if st == nil {
+		return
+	}
+	st.PendingHandler = strings.TrimSpace(handler)
+	st.PendingMessage = strings.TrimSpace(pendingMessage)
+	st.UpdatedAt = time.Now()
+}
+
+func (c *ChatService) clearPending(conversationID string) {
+	st := c.getConversationState(conversationID)
+	if st == nil {
+		return
+	}
+	st.PendingHandler = ""
+	st.PendingMessage = ""
+	st.UpdatedAt = time.Now()
+}
+
+func (c *ChatService) updateConversationLocation(conversationID, city, region string) {
+	st := c.getConversationState(conversationID)
+	if st == nil {
+		return
+	}
+	if strings.TrimSpace(city) != "" {
+		st.City = strings.ToLower(strings.TrimSpace(city))
+	}
+	if strings.TrimSpace(region) != "" {
+		st.Region = strings.ToLower(strings.TrimSpace(region))
+	}
+	st.UpdatedAt = time.Now()
+}
+
+func (c *ChatService) updateConversationHost(conversationID, host string) {
+	st := c.getConversationState(conversationID)
+	if st == nil {
+		return
+	}
+	if strings.TrimSpace(host) != "" {
+		st.Host = strings.ToLower(strings.TrimSpace(host))
+	}
+	st.UpdatedAt = time.Now()
+}
+
+func normalizeLooseText(s string) string {
+	s = strings.ToLower(strings.TrimSpace(s))
+	if s == "" {
+		return ""
+	}
+	repl := strings.NewReplacer("_", " ", "-", " ")
+	s = repl.Replace(s)
+	s = strings.Join(strings.Fields(s), " ")
+	return s
+}
+
+func scoreDeviceNameMatch(query string, fields ...string) int {
+	q := normalizeLooseText(query)
+	if q == "" {
+		return 0
+	}
+	best := 0
+	for _, f := range fields {
+		ff := normalizeLooseText(f)
+		if ff == "" {
+			continue
+		}
+		s := 0
+		if ff == q {
+			s = 200
+		} else if strings.Contains(ff, q) {
+			s = 120
+		} else {
+			qParts := strings.Fields(q)
+			match := 0
+			for _, p := range qParts {
+				if len(p) < 3 {
+					continue
+				}
+				if strings.Contains(ff, p) {
+					match++
+				}
+			}
+			if match > 0 {
+				s = 10 * match
+			}
+		}
+		if s > best {
+			best = s
+		}
+	}
+	return best
+}
+
+func (c *ChatService) resolveHostFromDeviceName(ctx context.Context, conversationID string, name string) (string, *models.Step) {
+	if c.Gateway == nil {
+		return "", nil
+	}
+	st := c.getConversationState(conversationID)
+	city := ""
+	region := ""
+	if st != nil {
+		city = strings.ToLower(strings.TrimSpace(st.City))
+		region = strings.ToLower(strings.TrimSpace(st.Region))
+	}
+
+	// Require a reasonably strong match so we don't accidentally resolve to an unrelated device.
+	queryNorm := normalizeLooseText(name)
+	queryTokens := make([]string, 0)
+	for _, t := range strings.Fields(queryNorm) {
+		if len(t) >= 4 {
+			queryTokens = append(queryTokens, t)
+		}
+	}
+	if len(queryTokens) == 0 {
+		// Fall back to old behavior (but still with a higher threshold).
+		queryTokens = strings.Fields(queryNorm)
+	}
+	countTokenMatches := func(candidate string) int {
+		cand := normalizeLooseText(candidate)
+		if cand == "" {
+			return 0
+		}
+		m := 0
+		for _, qt := range queryTokens {
+			if len(qt) < 3 {
+				continue
+			}
+			if strings.Contains(cand, qt) {
+				m++
+			}
+		}
+		return m
+	}
+
+	bestHost := ""
+	bestScore := 0
+	var bestStep *models.Step
+
+	// Prefer the search endpoint when available, but different deployments may use different param names.
+	searchQuery := urlEscape(strings.TrimSpace(name))
+	searchCandidates := []struct {
+		tool string
+		path string
+	}{
+		{tool: "adsDevicesSearch", path: "/ads/devices/search?query=" + searchQuery + "&page=1&page_size=50"},
+		{tool: "adsDevicesSearch", path: "/ads/devices/search?q=" + searchQuery + "&page=1&page_size=50"},
+		{tool: "adsDevicesSearch", path: "/ads/devices/search?search=" + searchQuery + "&page=1&page_size=50"},
+		{tool: "adsDevices", path: "/ads/devices?query=" + searchQuery + "&page=1&page_size=200"},
+		{tool: "adsDevices", path: "/ads/devices?search=" + searchQuery + "&page=1&page_size=200"},
+	}
+	if city != "" {
+		for i := range searchCandidates {
+			searchCandidates[i].path += "&city=" + urlEscape(city)
+		}
+	}
+
+	parseRows := func(body []byte) []any {
+		var root map[string]any
+		if json.Unmarshal(body, &root) != nil {
+			return nil
+		}
+		if rows, ok := root["data"].([]any); ok {
+			return rows
+		}
+		if rows, ok := root["items"].([]any); ok {
+			return rows
+		}
+		return nil
+	}
+
+	for _, cand := range searchCandidates {
+		status, body, err := c.Gateway.Get(cand.path)
+		searchStep := &models.Step{Tool: cand.tool, Status: status}
+		if err != nil {
+			searchStep.Error = err.Error()
+			bestStep = searchStep
+			continue
+		}
+		searchStep.Body = clipString(strings.TrimSpace(string(body)), 2000)
+		bestStep = searchStep
+		if status == 400 {
+			// Likely wrong parameter name / endpoint shape; try the next candidate.
+			continue
+		}
+		if status < 200 || status >= 300 {
+			continue
+		}
+		rows := parseRows(body)
+		if len(rows) == 0 {
+			continue
+		}
+		for _, it := range rows {
+				m, ok := it.(map[string]any)
+				if !ok {
+					continue
+				}
+				rowCity, _ := m["city"].(string)
+				rowRegion, _ := m["region"].(string)
+				if region != "" && strings.ToLower(strings.TrimSpace(rowRegion)) != region {
+					continue
+				}
+				kioskName, _ := m["kiosk_name"].(string)
+				if strings.TrimSpace(kioskName) == "" {
+					kioskName, _ = m["kioskName"].(string)
+				}
+				deviceName, _ := m["name"].(string)
+				hostName, _ := m["host_name"].(string)
+				serverID, _ := m["server_id"].(string)
+				candidateHost := strings.TrimSpace(serverID)
+				if candidateHost == "" {
+					candidateHost = strings.TrimSpace(hostName)
+				}
+				if candidateHost == "" {
+					continue
+				}
+				nameHits := countTokenMatches(kioskName) + countTokenMatches(deviceName)
+				if nameHits < 2 {
+					continue
+				}
+				score := scoreDeviceNameMatch(name, kioskName, deviceName, hostName, serverID, rowCity, rowRegion)
+				if score > bestScore {
+					bestScore = score
+					bestHost = candidateHost
+				}
+			}
+		if bestScore >= 60 {
+			return strings.ToLower(strings.TrimSpace(bestHost)), bestStep
+		}
+	}
+
+	page := 1
+	pageSize := 200
+	maxPages := 10
+	for {
+		path := fmt.Sprintf("/ads/devices?page=%d&page_size=%d", page, pageSize)
+		if city != "" {
+			path += "&city=" + urlEscape(city)
+		}
+		status, body, err := c.Gateway.Get(path)
+		step := &models.Step{Tool: "adsDevices", Status: status}
+		if err != nil {
+			step.Error = err.Error()
+			// Return the last step on error.
+			return "", step
+		}
+		step.Body = clipString(strings.TrimSpace(string(body)), 2000)
+		bestStep = step
+		if status < 200 || status >= 300 {
+			return "", step
+		}
+
+		var root map[string]any
+		if json.Unmarshal(body, &root) != nil {
+			return "", step
+		}
+		rows, _ := root["data"].([]any)
+		pagination, _ := root["pagination"].(map[string]any)
+		hasMore := false
+		if pagination != nil {
+			if v, ok := pagination["has_more"].(bool); ok {
+				hasMore = v
+			}
+		}
+
+		for _, it := range rows {
+			m, ok := it.(map[string]any)
+			if !ok {
+				continue
+			}
+
+			rowCity, _ := m["city"].(string)
+			rowRegion, _ := m["region"].(string)
+			if region != "" && strings.ToLower(strings.TrimSpace(rowRegion)) != region {
+				continue
+			}
+
+			kioskName, _ := m["kiosk_name"].(string)
+			if strings.TrimSpace(kioskName) == "" {
+				kioskName, _ = m["kioskName"].(string)
+			}
+			deviceName, _ := m["name"].(string)
+			hostName, _ := m["host_name"].(string)
+			serverID, _ := m["server_id"].(string)
+
+			// Choose the best candidate identifier to use as server_id for metrics.
+			candidateHost := strings.TrimSpace(serverID)
+			if candidateHost == "" {
+				candidateHost = strings.TrimSpace(hostName)
+			}
+			if candidateHost == "" {
+				continue
+			}
+
+			// Require multiple token hits on the human-readable name to avoid random matches.
+			nameHits := countTokenMatches(kioskName) + countTokenMatches(deviceName)
+			if nameHits < 2 {
+				continue
+			}
+
+			score := scoreDeviceNameMatch(name, kioskName, deviceName, hostName, serverID, rowCity, rowRegion)
+			if score > bestScore {
+				bestScore = score
+				bestHost = candidateHost
+			}
+		}
+
+		// If we already have a strong match, stop early.
+		if bestScore >= 80 {
+			break
+		}
+		if !hasMore {
+			break
+		}
+		page++
+		if page > maxPages {
+			break
+		}
+	}
+	if bestScore < 60 {
+		return "", bestStep
+	}
+	return strings.ToLower(strings.TrimSpace(bestHost)), bestStep
 }
 
 type projectLookup struct {
@@ -984,6 +1633,180 @@ func (c *ChatService) handleKioskCountFromCity(ctx context.Context, req models.C
 	return models.ChatResponse{Answer: answer, Steps: []models.Step{step}}, true, nil
 }
 
+func (c *ChatService) handleMetricsTodayByLocation(ctx context.Context, req models.ChatRequest, onToken func(string)) (models.ChatResponse, bool, error) {
+	msgLower := strings.ToLower(req.Message)
+	if !(strings.Contains(msgLower, "metric") || strings.Contains(msgLower, "metrics")) {
+		return models.ChatResponse{}, false, nil
+	}
+	if !(strings.Contains(msgLower, "today") || strings.Contains(msgLower, "today's") || strings.Contains(msgLower, "todays")) {
+		return models.ChatResponse{}, false, nil
+	}
+	// If the user specified a host, the per-host telemetry handler should handle it.
+	if len(detectHostTokens(req.Message)) > 0 {
+		return models.ChatResponse{}, false, nil
+	}
+
+	conversationID := strings.TrimSpace(req.ConversationID)
+	cityRaw := c.detectCityCode(ctx, msgLower)
+	region := c.detectRegionCode(ctx, msgLower)
+	city, _ := normalizeCitySelection(cityRaw, region, msgLower)
+	if city == "" && region == "" && conversationID != "" {
+		// Reuse last location context for follow-ups like "show today's metrics".
+		if st := c.getConversationState(conversationID); st != nil {
+			if strings.TrimSpace(st.City) != "" {
+				city = strings.ToLower(strings.TrimSpace(st.City))
+			}
+			if strings.TrimSpace(st.Region) != "" {
+				region = strings.ToLower(strings.TrimSpace(st.Region))
+			}
+		}
+	}
+	if city == "" && region == "" {
+		// Don't fall through into host telemetry prompts for "today's metrics".
+		return models.ChatResponse{Answer: "Please specify a city and/or region (for example: city moco, region brt)."}, true, nil
+	}
+	if strings.TrimSpace(req.ConversationID) != "" {
+		c.updateConversationLocation(req.ConversationID, city, region)
+		if strings.TrimSpace(region) != "" {
+			c.updateConversationLocation(req.ConversationID, "", region)
+		}
+		c.clearPending(req.ConversationID)
+	}
+	if c.Gateway == nil {
+		return models.ChatResponse{Answer: "Tool gateway is not configured."}, true, nil
+	}
+
+	filterCity := strings.ToLower(strings.TrimSpace(city))
+	filterRegion := strings.ToLower(strings.TrimSpace(region))
+
+	count := 0
+	online := 0
+	var cpuSum, memSum, tempSum float64
+	var dailyRx, dailyTx, monthlyRx, monthlyTx int64
+	latest := time.Time{}
+
+	steps := make([]models.Step, 0, 3)
+	page := 1
+	pageSize := 200
+	maxPages := 5
+	for {
+		path := fmt.Sprintf("/metrics/latest?page=%d&page_size=%d&include_totals=false", page, pageSize)
+		status, body, err := c.Gateway.Get(path)
+		step := models.Step{Tool: "metricsLatest", Status: status}
+		if err != nil {
+			step.Error = err.Error()
+		} else {
+			step.Body = clipString(strings.TrimSpace(string(body)), 2000)
+		}
+		steps = append(steps, step)
+
+		if err != nil {
+			return models.ChatResponse{Answer: "Failed to fetch latest metrics: " + err.Error(), Steps: steps}, true, nil
+		}
+		if status < 200 || status >= 300 {
+			return models.ChatResponse{Answer: fmt.Sprintf("Failed to fetch latest metrics (status %d).", status), Steps: steps}, true, nil
+		}
+
+		var payload struct {
+			Data []struct {
+				Time              time.Time `json:"time"`
+				CPU               float64   `json:"cpu"`
+				Memory            float64   `json:"memory"`
+				Temperature       float64   `json:"temperature"`
+				NetDailyRxBytes   int64     `json:"net_daily_rx_bytes"`
+				NetDailyTxBytes   int64     `json:"net_daily_tx_bytes"`
+				NetMonthlyRxBytes int64     `json:"net_monthly_rx_bytes"`
+				NetMonthlyTxBytes int64     `json:"net_monthly_tx_bytes"`
+				PowerOnline       bool      `json:"power_online"`
+				City              string    `json:"city"`
+				Region            string    `json:"region"`
+			} `json:"data"`
+			Pagination struct {
+				HasMore bool `json:"has_more"`
+			} `json:"pagination"`
+		}
+		if json.Unmarshal(body, &payload) != nil {
+			return models.ChatResponse{Answer: "Latest metrics response could not be parsed.", Steps: steps}, true, nil
+		}
+
+		for _, row := range payload.Data {
+			rowCity := strings.ToLower(strings.TrimSpace(row.City))
+			rowRegion := strings.ToLower(strings.TrimSpace(row.Region))
+			if filterCity != "" && rowCity != filterCity {
+				continue
+			}
+			if filterRegion != "" && rowRegion != filterRegion {
+				continue
+			}
+			count++
+			if row.PowerOnline {
+				online++
+			}
+			cpuSum += row.CPU
+			memSum += row.Memory
+			tempSum += row.Temperature
+			dailyRx += row.NetDailyRxBytes
+			dailyTx += row.NetDailyTxBytes
+			monthlyRx += row.NetMonthlyRxBytes
+			monthlyTx += row.NetMonthlyTxBytes
+			if row.Time.After(latest) {
+				latest = row.Time
+			}
+		}
+
+		if !payload.Pagination.HasMore {
+			break
+		}
+		page++
+		if page > maxPages {
+			break
+		}
+	}
+
+	scopeParts := make([]string, 0, 2)
+	if filterCity != "" {
+		scopeParts = append(scopeParts, fmt.Sprintf("city '%s'", filterCity))
+	}
+	if filterRegion != "" {
+		scopeParts = append(scopeParts, fmt.Sprintf("region '%s'", filterRegion))
+	}
+	scopeLabel := strings.Join(scopeParts, ", ")
+	if scopeLabel == "" {
+		scopeLabel = "the requested scope"
+	}
+
+	if count == 0 {
+		answer := fmt.Sprintf("No latest metrics were found for %s.", scopeLabel)
+		if onToken != nil {
+			onToken(answer)
+		}
+		return models.ChatResponse{Answer: answer, Steps: steps}, true, nil
+	}
+
+	avgCPU := cpuSum / float64(count)
+	avgMem := memSum / float64(count)
+	avgTemp := tempSum / float64(count)
+
+	answer := fmt.Sprintf(
+		"Today's metrics for %s: %d devices (%d online). Network daily RX %.1f MB, TX %.1f MB | monthly RX %.1f MB, TX %.1f MB. Avg CPU %.1f%%, memory %.1f%%, temp %.1f°C. (latest %s UTC).",
+		scopeLabel,
+		count,
+		online,
+		bytesToMiB(dailyRx),
+		bytesToMiB(dailyTx),
+		bytesToMiB(monthlyRx),
+		bytesToMiB(monthlyTx),
+		avgCPU,
+		avgMem,
+		avgTemp,
+		latest.Format(time.RFC3339),
+	)
+	if onToken != nil {
+		onToken(answer)
+	}
+	return models.ChatResponse{Answer: answer, Steps: steps}, true, nil
+}
+
 func extractTopN(msgLower string) int {
 	s := strings.ToLower(strings.TrimSpace(msgLower))
 	if s == "" {
@@ -1022,10 +1845,26 @@ func (c *ChatService) handlePopStatsGeneric(ctx context.Context, req models.Chat
 		return models.ChatResponse{}, false, nil
 	}
 
+	conversationID := strings.TrimSpace(req.ConversationID)
 	city := c.detectCityCode(ctx, msgLower)
 	region := c.detectRegionCode(ctx, msgLower)
+	// Reuse last city/region for follow-ups like "show pop stats".
+	if city == "" && region == "" && conversationID != "" {
+		if st := c.getConversationState(conversationID); st != nil {
+			if strings.TrimSpace(st.City) != "" {
+				city = strings.ToLower(strings.TrimSpace(st.City))
+			}
+			if strings.TrimSpace(st.Region) != "" {
+				region = strings.ToLower(strings.TrimSpace(st.Region))
+			}
+		}
+	}
 	if city == "" && region == "" {
 		return models.ChatResponse{Answer: "Please specify a city or region code (for example: kcmo or brt)."}, true, nil
+	}
+	if conversationID != "" {
+		c.updateConversationLocation(conversationID, city, region)
+		c.clearPending(conversationID)
 	}
 	if c.Gateway == nil {
 		return models.ChatResponse{Answer: "Tool gateway is not configured."}, true, nil
@@ -1205,12 +2044,38 @@ func (c *ChatService) handleDeviceTelemetry(ctx context.Context, req models.Chat
 
 	hostTokens := detectHostTokens(req.Message)
 	if len(hostTokens) == 0 {
+		conversationID := strings.TrimSpace(req.ConversationID)
+		if conversationID != "" {
+			// If we already resolved a host earlier in this conversation, reuse it.
+			if st := c.getConversationState(conversationID); st != nil {
+				lastHost := strings.TrimSpace(st.Host)
+				if lastHost != "" {
+					req2 := req
+					req2.Message = strings.TrimSpace(req.Message) + " " + lastHost
+					return c.handleDeviceTelemetry(ctx, req2, onToken)
+				}
+			}
+			c.setPending(conversationID, "deviceTelemetry", req.Message)
+		}
 		return models.ChatResponse{Answer: "Please specify the device or server name (for example: dart2)."}, true, nil
 	}
 
 	host := strings.ToLower(strings.TrimSpace(hostTokens[0]))
 	if host == "" {
+		conversationID := strings.TrimSpace(req.ConversationID)
+		if conversationID != "" {
+			c.setPending(conversationID, "deviceTelemetry", req.Message)
+		}
 		return models.ChatResponse{Answer: "Please specify the device or server name (for example: dart2)."}, true, nil
+	}
+	if strings.TrimSpace(req.ConversationID) != "" {
+		c.updateConversationHost(req.ConversationID, host)
+		// Derive city/region from host prefix when possible (e.g. moco-brt-...).
+		parts := strings.Split(strings.ReplaceAll(host, "_", "-"), "-")
+		if len(parts) >= 2 {
+			c.updateConversationLocation(req.ConversationID, parts[0], parts[1])
+		}
+		c.clearPending(req.ConversationID)
 	}
 
 	includeTotals := "false"
@@ -1473,6 +2338,31 @@ func (c *ChatService) detectRegionCode(ctx context.Context, msgLower string) str
 		return ""
 	}
 
+	// Prefer explicit "<code> region" or "region <code>" patterns to avoid mis-detecting city tokens
+	// as region tokens when both are present (e.g. "moco city brt region").
+	if strings.Contains(s, "region") {
+		words := tokenizeWords(s)
+		for i := 0; i < len(words); i++ {
+			if words[i] != "region" {
+				continue
+			}
+			// region <code>
+			if i+1 < len(words) {
+				cand := strings.ToLower(strings.TrimSpace(words[i+1]))
+				if cand != "" && c.isKnownRegionCode(ctx, cand) {
+					return cand
+				}
+			}
+			// <code> region
+			if i-1 >= 0 {
+				cand := strings.ToLower(strings.TrimSpace(words[i-1]))
+				if cand != "" && c.isKnownRegionCode(ctx, cand) {
+					return cand
+				}
+			}
+		}
+	}
+
 	// Minimal aliases for common user phrasing.
 	if strings.Contains(s, "bus rapid transit") {
 		return "brt"
@@ -1491,6 +2381,13 @@ func (c *ChatService) detectRegionCode(ctx context.Context, msgLower string) str
 		// If a token is both a region code and a known project city code (e.g. "kcmo"),
 		// treat it as a city unless the user explicitly asked for a region.
 		if !strings.Contains(s, "region") && len(r) > 3 && c.isKnownProjectCityCode(ctx, r) {
+			continue
+		}
+		// Avoid false positives for very short codes like "da" matching inside words like "today".
+		if len(r) <= 2 {
+			if containsWord(s, r) {
+				return r
+			}
 			continue
 		}
 		if strings.Contains(s, r) {
@@ -2021,13 +2918,28 @@ func (c *ChatService) handleTopPostersFromCity(ctx context.Context, req models.C
 	if !isTopPostersFromCityIntent(msgLower) {
 		return models.ChatResponse{}, false, nil
 	}
+	conversationID := strings.TrimSpace(req.ConversationID)
 	city := c.detectCityCode(ctx, msgLower)
 	region := ""
 	if city == "" {
 		region = c.detectRegionCode(ctx, msgLower)
-		if region == "" {
+		// Memory fallback: "show top posters" should reuse last scope.
+		if region == "" && conversationID != "" {
+			if st := c.getConversationState(conversationID); st != nil {
+				if strings.TrimSpace(st.Region) != "" {
+					region = strings.ToLower(strings.TrimSpace(st.Region))
+				} else if strings.TrimSpace(st.City) != "" {
+					city = strings.ToLower(strings.TrimSpace(st.City))
+				}
+			}
+		}
+		if region == "" && city == "" {
 			return models.ChatResponse{Answer: "Please specify a city code (for example: kcmo, kc, brt, dart)."}, true, nil
 		}
+	}
+	if conversationID != "" {
+		c.updateConversationLocation(conversationID, city, region)
+		c.clearPending(conversationID)
 	}
 	if c.Gateway == nil {
 		return models.ChatResponse{Answer: "Tool gateway is not configured."}, true, nil
@@ -2121,13 +3033,28 @@ func (c *ChatService) handleTopDevicesFromCity(ctx context.Context, req models.C
 	if !isTopDevicesFromCityIntent(msgLower) {
 		return models.ChatResponse{}, false, nil
 	}
+	conversationID := strings.TrimSpace(req.ConversationID)
 	city := c.detectCityCode(ctx, msgLower)
 	region := ""
 	if city == "" {
 		region = c.detectRegionCode(ctx, msgLower)
-		if region == "" {
+		// Memory fallback: "show top devices" should reuse last scope.
+		if region == "" && conversationID != "" {
+			if st := c.getConversationState(conversationID); st != nil {
+				if strings.TrimSpace(st.Region) != "" {
+					region = strings.ToLower(strings.TrimSpace(st.Region))
+				} else if strings.TrimSpace(st.City) != "" {
+					city = strings.ToLower(strings.TrimSpace(st.City))
+				}
+			}
+		}
+		if region == "" && city == "" {
 			return models.ChatResponse{Answer: "Please specify a city code (for example: kcmo, kc, brt, dart)."}, true, nil
 		}
+	}
+	if conversationID != "" {
+		c.updateConversationLocation(conversationID, city, region)
+		c.clearPending(conversationID)
 	}
 	if c.Gateway == nil {
 		return models.ChatResponse{Answer: "Tool gateway is not configured."}, true, nil
@@ -2317,8 +3244,8 @@ func extractAfterKeyword(msgLower, keyword string) string {
 }
 
 func urlEscape(s string) string {
-	replacer := strings.NewReplacer("%", "%25", "/", "%2F", "?", "%3F", "#", "%23")
-	return replacer.Replace(s)
+	// url.QueryEscape is appropriate for encoding query parameter values.
+	return url.QueryEscape(strings.TrimSpace(s))
 }
 
 func cityFromDeviceKey(key string) string {
@@ -3045,29 +3972,101 @@ func (c *ChatService) buildHistory(ctx context.Context, ownerKey, conversationID
 }
 
 func (c *ChatService) Chat(ctx context.Context, ownerKey string, req models.ChatRequest) (models.ChatResponse, error) {
+	conversationID := strings.TrimSpace(req.ConversationID)
+	if conversationID != "" {
+		c.ensureConversationStateHydrated(ctx, ownerKey, conversationID)
+		_ = c.Store.AppendMessage(ctx, ownerKey, conversationID, "user", req.Message)
+	}
+	if conversationID != "" {
+		st := c.getConversationState(conversationID)
+		if st != nil && st.PendingHandler == "deviceTelemetry" {
+			hostTokens := detectHostTokens(req.Message)
+			// If the user's reply looks like a kiosk/device display name (spaces) or a generic token like "kiosk-1",
+			// prefer resolving it to a real host via /ads/devices.
+			shouldResolve := false
+			if len(hostTokens) == 0 {
+				shouldResolve = true
+			} else {
+				msgHasSpaces := strings.Contains(strings.TrimSpace(req.Message), " ")
+				candidate := strings.ToLower(strings.TrimSpace(hostTokens[0]))
+				// A typical SCM host is like city-region-... (>=3 dash segments). Tokens like kiosk-1 are ambiguous.
+				parts := strings.Split(strings.ReplaceAll(candidate, "_", "-"), "-")
+				if msgHasSpaces || len(parts) < 3 {
+					shouldResolve = true
+				}
+			}
+			if shouldResolve {
+				if host, step := c.resolveHostFromDeviceName(ctx, conversationID, req.Message); strings.TrimSpace(host) != "" {
+					msg := strings.TrimSpace(st.PendingMessage)
+					if msg == "" {
+						msg = "show telemetry"
+					}
+					c.clearPending(conversationID)
+					req2 := req
+					req2.Message = msg + " " + host
+					resp, handled, err := c.handleDeviceTelemetry(ctx, req2, nil)
+					if handled {
+						if step != nil {
+							resp.Steps = append([]models.Step{*step}, resp.Steps...)
+						}
+						return resp, err
+					}
+				}
+				c.clearPending(conversationID)
+				return models.ChatResponse{Answer: "I couldn't find a device matching that name. Please reply with the host/server id (for example: moco-brt-briggs-001)."}, nil
+			}
+		}
+	}
+
 	if resp, handled, err := c.handleTopPostersFromCity(ctx, req, nil); handled {
+		if conversationID != "" {
+			_ = c.Store.AppendMessage(ctx, ownerKey, conversationID, "assistant", resp.Answer)
+		}
 		return resp, err
 	}
 	if resp, handled, err := c.handleTopDevicesFromCity(ctx, req, nil); handled {
+		if conversationID != "" {
+			_ = c.Store.AppendMessage(ctx, ownerKey, conversationID, "assistant", resp.Answer)
+		}
 		return resp, err
 	}
 	if resp, handled, err := c.handleKioskCountFromCity(ctx, req, nil); handled {
+		if conversationID != "" {
+			_ = c.Store.AppendMessage(ctx, ownerKey, conversationID, "assistant", resp.Answer)
+		}
+		return resp, err
+	}
+	if resp, handled, err := c.handlePopTodayByHost(ctx, req, nil); handled {
+		if conversationID != "" {
+			_ = c.Store.AppendMessage(ctx, ownerKey, conversationID, "assistant", resp.Answer)
+		}
+		return resp, err
+	}
+	if resp, handled, err := c.handleMetricsTodayByLocation(ctx, req, nil); handled {
+		if conversationID != "" {
+			_ = c.Store.AppendMessage(ctx, ownerKey, conversationID, "assistant", resp.Answer)
+		}
 		return resp, err
 	}
 	if resp, handled, err := c.handleDeviceTelemetry(ctx, req, nil); handled {
+		if conversationID != "" {
+			_ = c.Store.AppendMessage(ctx, ownerKey, conversationID, "assistant", resp.Answer)
+		}
 		return resp, err
 	}
 	if resp, handled, err := c.handleCreativeUpload(ctx, ownerKey, req); handled {
+		if conversationID != "" {
+			_ = c.Store.AppendMessage(ctx, ownerKey, conversationID, "assistant", resp.Answer)
+		}
 		return resp, err
 	}
 	if resp, handled, err := c.handlePosterDetails(ctx, req, nil); handled {
+		if conversationID != "" {
+			_ = c.Store.AppendMessage(ctx, ownerKey, conversationID, "assistant", resp.Answer)
+		}
 		return resp, err
 	}
 
-	conversationID := strings.TrimSpace(req.ConversationID)
-	if conversationID != "" {
-		_ = c.Store.AppendMessage(ctx, ownerKey, conversationID, "user", req.Message)
-	}
 	
 	// Check for specific stat requests that need special handling
 	var isStatsRequest bool
@@ -3257,28 +4256,100 @@ Always use city_code (like "kcmo") or region (like "brt") in query params when a
 }
 
 func (c *ChatService) ChatStream(ctx context.Context, ownerKey string, req models.ChatRequest, onToken func(string)) (models.ChatResponse, error) {
+	conversationID := strings.TrimSpace(req.ConversationID)
+	if conversationID != "" {
+		c.ensureConversationStateHydrated(ctx, ownerKey, conversationID)
+		_ = c.Store.AppendMessage(ctx, ownerKey, conversationID, "user", req.Message)
+	}
+	if conversationID != "" {
+		st := c.getConversationState(conversationID)
+		if st != nil && st.PendingHandler == "deviceTelemetry" {
+			hostTokens := detectHostTokens(req.Message)
+			shouldResolve := false
+			if len(hostTokens) == 0 {
+				shouldResolve = true
+			} else {
+				msgHasSpaces := strings.Contains(strings.TrimSpace(req.Message), " ")
+				candidate := strings.ToLower(strings.TrimSpace(hostTokens[0]))
+				parts := strings.Split(strings.ReplaceAll(candidate, "_", "-"), "-")
+				if msgHasSpaces || len(parts) < 3 {
+					shouldResolve = true
+				}
+			}
+			if shouldResolve {
+				if host, step := c.resolveHostFromDeviceName(ctx, conversationID, req.Message); strings.TrimSpace(host) != "" {
+					msg := strings.TrimSpace(st.PendingMessage)
+					if msg == "" {
+						msg = "show telemetry"
+					}
+					c.clearPending(conversationID)
+					req2 := req
+					req2.Message = msg + " " + host
+					resp, handled, err := c.handleDeviceTelemetry(ctx, req2, onToken)
+					if handled {
+						if step != nil {
+							resp.Steps = append([]models.Step{*step}, resp.Steps...)
+						}
+						return resp, err
+					}
+				}
+				c.clearPending(conversationID)
+				answer := "I couldn't find a device matching that name. Please reply with the host/server id (for example: moco-brt-briggs-001)."
+				if onToken != nil {
+					onToken(answer)
+				}
+				return models.ChatResponse{Answer: answer}, nil
+			}
+		}
+	}
+
 	if resp, handled, err := c.handleTopPostersFromCity(ctx, req, onToken); handled {
+		if conversationID != "" {
+			_ = c.Store.AppendMessage(ctx, ownerKey, conversationID, "assistant", resp.Answer)
+		}
 		return resp, err
 	}
 	if resp, handled, err := c.handleTopDevicesFromCity(ctx, req, onToken); handled {
+		if conversationID != "" {
+			_ = c.Store.AppendMessage(ctx, ownerKey, conversationID, "assistant", resp.Answer)
+		}
 		return resp, err
 	}
 	if resp, handled, err := c.handleKioskCountFromCity(ctx, req, onToken); handled {
+		if conversationID != "" {
+			_ = c.Store.AppendMessage(ctx, ownerKey, conversationID, "assistant", resp.Answer)
+		}
+		return resp, err
+	}
+	if resp, handled, err := c.handlePopTodayByHost(ctx, req, onToken); handled {
+		if conversationID != "" {
+			_ = c.Store.AppendMessage(ctx, ownerKey, conversationID, "assistant", resp.Answer)
+		}
+		return resp, err
+	}
+	if resp, handled, err := c.handleMetricsTodayByLocation(ctx, req, onToken); handled {
+		if conversationID != "" {
+			_ = c.Store.AppendMessage(ctx, ownerKey, conversationID, "assistant", resp.Answer)
+		}
 		return resp, err
 	}
 	if resp, handled, err := c.handleDeviceTelemetry(ctx, req, onToken); handled {
+		if conversationID != "" {
+			_ = c.Store.AppendMessage(ctx, ownerKey, conversationID, "assistant", resp.Answer)
+		}
 		return resp, err
 	}
 	if resp, handled, err := c.handleCreativeUpload(ctx, ownerKey, req); handled {
+		if conversationID != "" {
+			_ = c.Store.AppendMessage(ctx, ownerKey, conversationID, "assistant", resp.Answer)
+		}
 		return resp, err
 	}
 	if resp, handled, err := c.handlePosterDetails(ctx, req, onToken); handled {
+		if conversationID != "" {
+			_ = c.Store.AppendMessage(ctx, ownerKey, conversationID, "assistant", resp.Answer)
+		}
 		return resp, err
-	}
-
-	conversationID := strings.TrimSpace(req.ConversationID)
-	if conversationID != "" {
-		_ = c.Store.AppendMessage(ctx, ownerKey, conversationID, "user", req.Message)
 	}
 
 	data, steps, toolData := c.prefetchImpressions(ctx, req.Message)
