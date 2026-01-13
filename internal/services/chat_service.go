@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"openai-agent-service/internal/models"
 )
@@ -98,6 +99,64 @@ func applyQueryDefaults(method, path string, query map[string]string) map[string
 	return query
 }
 
+func (c *ChatService) isKnownRegionCode(ctx context.Context, code string) bool {
+	code = strings.ToLower(strings.TrimSpace(code))
+	if code == "" {
+		return false
+	}
+	c.cityMu.Lock()
+	defer c.cityMu.Unlock()
+
+	c.ensureCityRegionCachesLocked(ctx)
+	if c.regionCache == nil {
+		return false
+	}
+	_, ok := c.regionCache[code]
+	return ok
+}
+
+func (c *ChatService) isKnownProjectCityCode(ctx context.Context, code string) bool {
+	code = strings.ToLower(strings.TrimSpace(code))
+	if code == "" {
+		return false
+	}
+	c.projectMu.Lock()
+	defer c.projectMu.Unlock()
+
+	c.ensureProjectLookupsLocked(ctx)
+	if c.projectCityCache == nil {
+		return false
+	}
+	_, ok := c.projectCityCache[code]
+	return ok
+}
+
+func (c *ChatService) normalizePopQueryLocation(ctx context.Context, path string, query map[string]string) map[string]string {
+	if query == nil {
+		return query
+	}
+	p := strings.TrimSpace(path)
+	if p != "/pop/stats" {
+		return query
+	}
+	city := strings.ToLower(strings.TrimSpace(query["city"]))
+	if city == "" {
+		return query
+	}
+	// If model incorrectly passes a region code in city param (e.g. city=brt, city=kc),
+	// rewrite to region=<code> and drop city to enforce correct scoping.
+	// Heuristic for overlaps (tokens that can exist as both city and region):
+	// - Short codes (<=3) default to region unless user explicitly sets region/city elsewhere.
+	// - Longer codes (e.g. moco, kcmo) default to city.
+	if strings.TrimSpace(query["region"]) == "" && c.isKnownRegionCode(ctx, city) {
+		if len(city) <= 3 || !c.isKnownProjectCityCode(ctx, city) {
+			query["region"] = city
+			delete(query, "city")
+		}
+	}
+	return query
+}
+
 func boolToOnOff(val bool) string {
 	if val {
 		return "on"
@@ -170,6 +229,21 @@ func isLikelyDataRequest(msg string) bool {
 		}
 	}
 	return false
+}
+
+func normalizeCitySelection(city, region, msgLower string) (string, bool) {
+	city = strings.ToLower(strings.TrimSpace(city))
+	region = strings.ToLower(strings.TrimSpace(region))
+	cityExplicit := false
+	if city != "" {
+		if len(city) >= 3 || region == "" || strings.Contains(msgLower, "city") {
+			cityExplicit = true
+		}
+	}
+	if region != "" && !cityExplicit {
+		city = ""
+	}
+	return city, cityExplicit
 }
 
 func isTopDevicesFromCityIntent(msgLower string) bool {
@@ -296,6 +370,7 @@ func (c *ChatService) chatWithToolLoop(ctx context.Context, messages []OpenAIMes
 			}
 
 			args.Query = applyQueryDefaults(method, path, args.Query)
+			args.Query = c.normalizePopQueryLocation(ctx, path, args.Query)
 
 			var status int
 			var body []byte
@@ -346,6 +421,22 @@ type ChatService struct {
 
 	regionCache   map[string]struct{}
 	regionCacheAt time.Time
+	regionToCity  map[string]string
+
+	projectMu           sync.Mutex
+	projectCityCache    map[string]struct{}
+	projectLookups      []projectLookup
+	projectCityCacheAt  time.Time
+	projectCacheTTL     time.Duration
+
+	projectMappingsOnce sync.Once
+}
+
+type projectLookup struct {
+	city        string
+	name        string
+	description string
+	words       []string
 }
 
 func (c *ChatService) ensureCityRegionCachesLocked(ctx context.Context) {
@@ -440,32 +531,268 @@ func (c *ChatService) detectCityCode(ctx context.Context, msgLower string) strin
 			continue
 		}
 		if strings.Contains(s, city) {
+			if !cityCandidateAllowed(city, s) {
+				continue
+			}
 			return city
 		}
+	}
+	if projectCity := c.detectCityFromProjects(ctx, s); projectCity != "" {
+		return projectCity
 	}
 	return ""
 }
 
+func (c *ChatService) detectCityFromProjects(ctx context.Context, msgLower string) string {
+	s := strings.ToLower(strings.TrimSpace(msgLower))
+	if s == "" {
+		return ""
+	}
+
+	// If the user provided a region code (e.g. "brt", "kc") and did not explicitly ask for a city,
+	// do not infer a city from project description/keywords. This avoids cases like "show brt stats"
+	// incorrectly mapping to a city whose description mentions BRT.
+	regionCode := c.detectRegionCode(ctx, s)
+	regionOnly := regionCode != "" && !strings.Contains(s, "city")
+
+	c.projectMu.Lock()
+	defer c.projectMu.Unlock()
+
+	c.ensureProjectLookupsLocked(ctx)
+	if len(c.projectLookups) == 0 {
+		return ""
+	}
+
+	msgWords := tokenizeWords(s)
+	wordSet := make(map[string]struct{}, len(msgWords))
+	for _, w := range msgWords {
+		if len(w) < 2 {
+			continue
+		}
+		wordSet[w] = struct{}{}
+	}
+
+	bestCity := ""
+	bestScore := 0
+
+	for _, lookup := range c.projectLookups {
+		if lookup.city == "" {
+			continue
+		}
+		score := 0
+		if len(lookup.city) <= 2 {
+			if containsWord(s, lookup.city) {
+				score = len(lookup.city)
+			}
+		} else if strings.Contains(s, lookup.city) {
+			score = len(lookup.city)
+		} else {
+			for _, w := range msgWords {
+				if len(w) < 3 {
+					continue
+				}
+				if strings.Contains(lookup.city, w) && len(w) > score {
+					score = len(w)
+				}
+			}
+		}
+
+		if score == 0 && lookup.name != "" && lookup.name != lookup.city && strings.Contains(s, lookup.name) {
+			score = len(lookup.name)
+		}
+
+		if score == 0 && lookup.description != "" && strings.Contains(s, lookup.description) {
+			score = len(lookup.description)
+		}
+
+		if score == 0 && len(lookup.words) > 0 && !regionOnly {
+			for _, alias := range lookup.words {
+				if len(alias) < 3 {
+					continue
+				}
+				if strings.Contains(s, alias) || strings.Contains(alias, s) {
+					if len(alias) > score {
+						score = len(alias)
+					}
+					continue
+				}
+				if _, ok := wordSet[alias]; ok && len(alias) > score {
+					score = len(alias)
+				}
+			}
+		}
+
+		if score > bestScore {
+			bestScore = score
+			bestCity = lookup.city
+		}
+	}
+
+	return bestCity
+}
+
+func (c *ChatService) ensureProjectLookupsLocked(ctx context.Context) {
+	if c.projectCacheTTL <= 0 {
+		c.projectCacheTTL = 10 * time.Minute
+	}
+	if c.projectLookups != nil && !c.projectCityCacheAt.IsZero() && time.Since(c.projectCityCacheAt) < c.projectCacheTTL {
+		return
+	}
+	if c.Gateway == nil {
+		return
+	}
+
+	status, body, err := c.Gateway.Get("/ads/projects?page=1&page_size=200")
+	if err != nil || status < 200 || status >= 300 {
+		return
+	}
+
+	var resp struct {
+		Data []struct {
+			Name        string  `json:"name"`
+			Description *string `json:"description"`
+		} `json:"data"`
+	}
+	if json.Unmarshal(body, &resp) != nil {
+		return
+	}
+
+	lookups := make([]projectLookup, 0, len(resp.Data))
+	citySet := make(map[string]struct{})
+	for _, item := range resp.Data {
+		nameLower := strings.ToLower(strings.TrimSpace(item.Name))
+		if nameLower == "" {
+			continue
+		}
+		descLower := ""
+		if item.Description != nil {
+			descLower = strings.ToLower(strings.TrimSpace(*item.Description))
+		}
+		words := collectProjectWords(nameLower, descLower)
+		lookups = append(lookups, projectLookup{
+			city:        nameLower,
+			name:        nameLower,
+			description: descLower,
+			words:       words,
+		})
+		citySet[nameLower] = struct{}{}
+	}
+
+	if len(lookups) == 0 {
+		return
+	}
+
+	c.projectLookups = lookups
+	c.projectCityCache = citySet
+	c.projectCityCacheAt = time.Now()
+}
+
+func tokenizeWords(input string) []string {
+	if strings.TrimSpace(input) == "" {
+		return nil
+	}
+	lower := strings.ToLower(input)
+	var words []string
+	var b strings.Builder
+	flush := func() {
+		if b.Len() == 0 {
+			return
+		}
+		words = append(words, b.String())
+		b.Reset()
+	}
+	for _, r := range lower {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+			b.WriteRune(r)
+		} else {
+			flush()
+		}
+	}
+	flush()
+	return words
+}
+
+func collectProjectWords(values ...string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{})
+	result := make([]string, 0)
+	for _, val := range values {
+		for _, w := range tokenizeWords(val) {
+			if len(w) < 2 {
+				continue
+			}
+			if _, ok := seen[w]; ok {
+				continue
+			}
+			seen[w] = struct{}{}
+			result = append(result, w)
+		}
+	}
+	return result
+}
+
+func containsWord(text, word string) bool {
+	if strings.TrimSpace(text) == "" || strings.TrimSpace(word) == "" {
+		return false
+	}
+	target := strings.ToLower(strings.TrimSpace(word))
+	for _, w := range tokenizeWords(text) {
+		if strings.EqualFold(w, target) {
+			return true
+		}
+	}
+	return false
+}
+
+func cityCandidateAllowed(city, msgLower string) bool {
+	if strings.TrimSpace(city) == "" || strings.TrimSpace(msgLower) == "" {
+		return false
+	}
+	if len(city) >= 3 {
+		return true
+	}
+	return strings.Contains(msgLower, "city") || strings.Contains(msgLower, "cities")
+}
+
 func (c *ChatService) handleKioskCountFromCity(ctx context.Context, req models.ChatRequest, onToken func(string)) (models.ChatResponse, bool, error) {
 	msgLower := strings.ToLower(req.Message)
-	if !(strings.Contains(msgLower, "kiosk") || strings.Contains(msgLower, "kiosks") || strings.Contains(msgLower, "device") || strings.Contains(msgLower, "devices")) {
+	containsDeviceWord := strings.Contains(msgLower, "kiosk") || strings.Contains(msgLower, "kiosks") || strings.Contains(msgLower, "device") || strings.Contains(msgLower, "devices")
+	containsDataWord := strings.Contains(msgLower, " data") || strings.Contains(msgLower, "data ")
+
+	// Host-specific "data usage" questions (e.g. "how much internet data <host> is using") should be
+	// handled by the per-host telemetry handler, not city/region status.
+	if containsDataWord {
+		hostTokens := detectHostTokens(req.Message)
+		if len(hostTokens) > 0 {
+			if strings.Contains(msgLower, "internet") || strings.Contains(msgLower, "bandwidth") || strings.Contains(msgLower, "traffic") ||
+				strings.Contains(msgLower, "throughput") || strings.Contains(msgLower, "usage") || strings.Contains(msgLower, "using") ||
+				strings.Contains(msgLower, "consumed") || strings.Contains(msgLower, "consumption") {
+				return models.ChatResponse{}, false, nil
+			}
+		}
+	}
+
+	cityRaw := c.detectCityCode(ctx, msgLower)
+	region := c.detectRegionCode(ctx, msgLower)
+	city, _ := normalizeCitySelection(cityRaw, region, msgLower)
+	hasLocation := city != "" || region != ""
+
+	if !(containsDeviceWord || (containsDataWord && hasLocation)) {
 		return models.ChatResponse{}, false, nil
 	}
+
 	hasCountKeyword := strings.Contains(msgLower, "how many") || strings.Contains(msgLower, "count") || strings.Contains(msgLower, "number of")
-	hasStatusKeyword := strings.Contains(msgLower, "offline") || strings.Contains(msgLower, "online") || strings.Contains(msgLower, "status") || strings.Contains(msgLower, "down")
+	// "data" is ambiguous; only treat it as a status request when the user also mentions kiosks/devices.
+	hasStatusKeyword := strings.Contains(msgLower, "offline") || strings.Contains(msgLower, "online") || strings.Contains(msgLower, "status") || strings.Contains(msgLower, "down") || (containsDataWord && hasLocation && containsDeviceWord)
 	if !(hasCountKeyword || hasStatusKeyword) {
 		return models.ChatResponse{}, false, nil
 	}
-	city := c.detectCityCode(ctx, msgLower)
-	region := c.detectRegionCode(ctx, msgLower)
 
 	if hasStatusKeyword {
-		queryCity := city
+		queryCity, _ := normalizeCitySelection(city, region, msgLower)
 		queryRegion := region
-		// Special-case: users often say "kc" meaning the KC region within KCMO.
-		if queryCity == "" && strings.EqualFold(region, "kc") {
-			queryCity = "kcmo"
-		}
 		if queryCity == "" && queryRegion == "" {
 			return models.ChatResponse{Answer: "Please specify a city code (for example: kcmo) or a region code (for example: kc)."}, true, nil
 		}
@@ -589,11 +916,6 @@ func (c *ChatService) handleKioskCountFromCity(ctx context.Context, req models.C
 	}
 
 	lookupCity := city
-	if lookupCity == "" && region != "" {
-		if strings.EqualFold(region, "kc") {
-			lookupCity = "kcmo"
-		}
-	}
 	if lookupCity == "" {
 		return models.ChatResponse{Answer: "Please specify a city code (for example: kcmo)."}, true, nil
 	}
@@ -662,6 +984,169 @@ func (c *ChatService) handleKioskCountFromCity(ctx context.Context, req models.C
 	return models.ChatResponse{Answer: answer, Steps: []models.Step{step}}, true, nil
 }
 
+func extractTopN(msgLower string) int {
+	s := strings.ToLower(strings.TrimSpace(msgLower))
+	if s == "" {
+		return 0
+	}
+	// Simple patterns: "top 5", "top 10".
+	for _, tok := range strings.Fields(s) {
+		if tok == "top" {
+			continue
+		}
+	}
+	parts := strings.Fields(s)
+	for i := 0; i < len(parts)-1; i++ {
+		if parts[i] == "top" {
+			if n, err := strconv.Atoi(strings.TrimSpace(parts[i+1])); err == nil {
+				if n > 0 {
+					if n > 200 {
+						return 200
+					}
+					return n
+				}
+			}
+		}
+	}
+	return 0
+}
+
+func (c *ChatService) handlePopStatsGeneric(ctx context.Context, req models.ChatRequest, onToken func(string)) (models.ChatResponse, bool, error) {
+	msgLower := strings.ToLower(req.Message)
+	if !(strings.Contains(msgLower, "stat") || strings.Contains(msgLower, "pop")) {
+		return models.ChatResponse{}, false, nil
+	}
+
+	if strings.Contains(msgLower, "top poster") || strings.Contains(msgLower, "top device") || strings.Contains(msgLower, "top kiosk") {
+		// Covered by specific handlers that run earlier.
+		return models.ChatResponse{}, false, nil
+	}
+
+	city := c.detectCityCode(ctx, msgLower)
+	region := c.detectRegionCode(ctx, msgLower)
+	if city == "" && region == "" {
+		return models.ChatResponse{Answer: "Please specify a city or region code (for example: kcmo or brt)."}, true, nil
+	}
+	if c.Gateway == nil {
+		return models.ChatResponse{Answer: "Tool gateway is not configured."}, true, nil
+	}
+
+	groupBy := ""
+	switch {
+	case strings.Contains(msgLower, "poster"):
+		groupBy = "poster"
+	case strings.Contains(msgLower, "device"):
+		groupBy = "device"
+	case strings.Contains(msgLower, "kiosk"):
+		groupBy = "kiosk"
+	}
+	if groupBy == "" {
+		groupBy = "poster"
+	}
+
+	metric := "clicks"
+	if strings.Contains(msgLower, "play") {
+		metric = "plays"
+	} else if strings.Contains(msgLower, "count") {
+		metric = "count"
+	}
+
+	limit := 10
+	basePath := fmt.Sprintf("/pop/stats?group_by=%s&metric=%s&order=top&limit=%d", groupBy, metric, limit)
+	path := basePath
+	scopeLabel := ""
+	if region != "" {
+		path += "&region=" + urlEscape(region)
+		scopeLabel = fmt.Sprintf("region '%s'", region)
+	} else if city != "" {
+		path += "&city=" + urlEscape(city)
+		scopeLabel = fmt.Sprintf("city '%s'", city)
+	}
+
+	status, body, err := c.Gateway.Get(path)
+	step := models.Step{Tool: "popStats", Status: status}
+	if err != nil {
+		step.Error = err.Error()
+	} else {
+		step.Body = clipString(strings.TrimSpace(string(body)), 2000)
+	}
+	steps := []models.Step{step}
+
+	if err != nil {
+		return models.ChatResponse{Answer: "Failed to fetch POP stats: " + err.Error(), Steps: steps}, true, nil
+	}
+	if status < 200 || status >= 300 {
+		answer := fmt.Sprintf("Failed to fetch POP stats (status %d).", status)
+		return models.ChatResponse{Answer: answer, Steps: []models.Step{step}}, true, nil
+	}
+
+	type popStatsResponse struct {
+		Items []map[string]any `json:"items"`
+	}
+	var parsed popStatsResponse
+	if json.Unmarshal(body, &parsed) != nil {
+		return models.ChatResponse{Answer: fmt.Sprintf("POP stats response for %s could not be parsed.", scopeLabel), Steps: []models.Step{step}}, true, nil
+	}
+
+	if len(parsed.Items) == 0 {
+		answer := fmt.Sprintf("No POP %s stats found for %s.", metric, scopeLabel)
+		return models.ChatResponse{Answer: answer, Steps: steps}, true, nil
+	}
+
+	lines := make([]string, 0, len(parsed.Items))
+	for idx, row := range parsed.Items {
+		if idx >= 10 {
+			break
+		}
+		name := ""
+		if groupBy == "poster" {
+			if s, ok := row["PosterName"].(string); ok && strings.TrimSpace(s) != "" {
+				name = s
+			}
+		}
+		if name == "" {
+			if s, ok := row["Key"].(string); ok {
+				name = s
+			}
+		}
+		if strings.TrimSpace(name) == "" {
+			continue
+		}
+		value := 0.0
+		switch v := row["Metric"].(type) {
+		case float64:
+			value = v
+		case int:
+			value = float64(v)
+		case json.Number:
+			if f, e := v.Float64(); e == nil {
+				value = f
+			}
+		}
+		lines = append(lines, fmt.Sprintf("%d. %s — %.0f %s", len(lines)+1, name, value, metric))
+	}
+
+	if len(lines) == 0 {
+		answer := fmt.Sprintf("No POP %s stats found for %s.", metric, scopeLabel)
+		return models.ChatResponse{Answer: answer, Steps: []models.Step{step}}, true, nil
+	}
+
+	prefix := "Top"
+	switch groupBy {
+	case "poster":
+		prefix = "Top posters"
+	case "device":
+		prefix = "Top devices"
+	case "kiosk":
+		prefix = "Top kiosks"
+	}
+	answer := fmt.Sprintf("%s in %s by %s:\n%s", prefix, scopeLabel, metric, strings.Join(lines, "\n"))
+	if onToken != nil {
+		onToken(answer)
+	}
+	return models.ChatResponse{Answer: answer, Steps: []models.Step{step}}, true, nil
+}
+
 func (c *ChatService) handleDeviceTelemetry(ctx context.Context, req models.ChatRequest, onToken func(string)) (models.ChatResponse, bool, error) {
 	msgLower := strings.ToLower(req.Message)
 	contains := func(tokens ...string) bool {
@@ -683,11 +1168,18 @@ func (c *ChatService) handleDeviceTelemetry(ctx context.Context, req models.Chat
 	wantsCPU := contains("cpu", "processor")
 	wantsMemory := contains("memory", "ram")
 	wantsDisk := contains("disk", "storage")
-	wantsNetwork := contains("network", "bandwidth", "traffic", "throughput")
+	// Network usage is often phrased as "how much data <host> is using".
+	wantsNetwork := contains("network", "bandwidth", "traffic", "throughput", "internet", "data usage", "data-use", "consumed", "consumption", "usage", "using")
 	wantsProcesses := contains("process", "service", "app", "apps", "kiosk")
 	wantsInputDevices := contains("input", "usb", "peripheral")
 	wantsUptime := contains("uptime")
 	wantsTelemetry := contains("telemetry", "status", "health", "metrics", "device status")
+	if !wantsNetwork {
+		// Heuristic: "how much data" implies usage even without the explicit token "usage".
+		if strings.Contains(msgLower, "how much") && strings.Contains(msgLower, "data") {
+			wantsNetwork = true
+		}
+	}
 	if wantsTelemetry {
 		wantsTemp = true
 		wantsVolume = true
@@ -721,7 +1213,11 @@ func (c *ChatService) handleDeviceTelemetry(ctx context.Context, req models.Chat
 		return models.ChatResponse{Answer: "Please specify the device or server name (for example: dart2)."}, true, nil
 	}
 
-	path := "/metrics/history?page=1&page_size=1&include_totals=false&server_id=" + urlEscape(host)
+	includeTotals := "false"
+	if wantsNetwork {
+		includeTotals = "true"
+	}
+	path := "/metrics/history?page=1&page_size=1&include_totals=" + includeTotals + "&server_id=" + urlEscape(host)
 	status, body, err := c.Gateway.Get(path)
 	step := models.Step{Tool: "metricsHistory", Status: status}
 	if err != nil {
@@ -732,9 +1228,9 @@ func (c *ChatService) handleDeviceTelemetry(ctx context.Context, req models.Chat
 
 	answer := ""
 	if err != nil {
-		answer = "Failed to fetch temperature data: " + err.Error()
+		answer = "Failed to fetch telemetry data: " + err.Error()
 	} else if status < 200 || status >= 300 {
-		answer = fmt.Sprintf("Failed to fetch temperature data (status %d).", status)
+		answer = fmt.Sprintf("Failed to fetch telemetry data (status %d).", status)
 	} else {
 		var payload struct {
 			Data []struct {
@@ -763,6 +1259,8 @@ func (c *ChatService) handleDeviceTelemetry(ctx context.Context, req models.Chat
 				NetBytesRecv         int64     `json:"net_bytes_recv"`
 				NetDailyRxBytes      int64     `json:"net_daily_rx_bytes"`
 				NetDailyTxBytes      int64     `json:"net_daily_tx_bytes"`
+				NetMonthlyRxBytes    int64     `json:"net_monthly_rx_bytes"`
+				NetMonthlyTxBytes    int64     `json:"net_monthly_tx_bytes"`
 				InputDevicesHealthy  int64     `json:"input_devices_healthy"`
 				InputDevicesMissing  int64     `json:"input_devices_missing"`
 				ProcessStatuses      []struct {
@@ -781,6 +1279,7 @@ func (c *ChatService) handleDeviceTelemetry(ctx context.Context, req models.Chat
 				} `json:"link_state"`
 				Uptime int64 `json:"uptime"`
 			} `json:"data"`
+			Totals map[string]any `json:"totals"`
 		}
 		if json.Unmarshal(body, &payload) != nil || len(payload.Data) == 0 {
 			answer = fmt.Sprintf("No telemetry was found for device '%s'.", host)
@@ -854,7 +1353,55 @@ func (c *ChatService) handleDeviceTelemetry(ctx context.Context, req models.Chat
 				sections = append(sections, fmt.Sprintf("Disk %.1f%% used (%.1f/%0.1f GB).", entry.Disk, bytesToGiB(entry.DiskUsedBytes), bytesToGiB(entry.DiskTotalBytes)))
 			}
 			if wantsNetwork {
-				sections = append(sections, fmt.Sprintf("Network daily RX %.1f MB, TX %.1f MB (current RX %d bytes).", bytesToMiB(entry.NetDailyRxBytes), bytesToMiB(entry.NetDailyTxBytes), entry.NetBytesRecv))
+				monthlyRx := int64(0)
+				monthlyTx := int64(0)
+				monthlyFromTotals := false
+				if payload.Totals != nil {
+					if v, ok := payload.Totals["net_monthly_rx_bytes"]; ok {
+						switch vv := v.(type) {
+						case float64:
+							monthlyRx = int64(vv)
+							monthlyFromTotals = true
+						case int64:
+							monthlyRx = vv
+							monthlyFromTotals = true
+						case json.Number:
+							if n, e := vv.Int64(); e == nil {
+								monthlyRx = n
+								monthlyFromTotals = true
+							}
+						}
+					}
+					if v, ok := payload.Totals["net_monthly_tx_bytes"]; ok {
+						switch vv := v.(type) {
+						case float64:
+							monthlyTx = int64(vv)
+							monthlyFromTotals = true
+						case int64:
+							monthlyTx = vv
+							monthlyFromTotals = true
+						case json.Number:
+							if n, e := vv.Int64(); e == nil {
+								monthlyTx = n
+								monthlyFromTotals = true
+							}
+						}
+					}
+				}
+				if !monthlyFromTotals {
+					// Some metrics deployments return monthly totals on the per-record entry.
+					monthlyRx = entry.NetMonthlyRxBytes
+					monthlyTx = entry.NetMonthlyTxBytes
+				}
+				netLine := fmt.Sprintf(
+					"Network current RX %.1f MB, TX %.1f MB | daily RX %.1f MB, TX %.1f MB",
+					bytesToMiB(entry.NetBytesRecv),
+					bytesToMiB(entry.NetBytesSent),
+					bytesToMiB(entry.NetDailyRxBytes),
+					bytesToMiB(entry.NetDailyTxBytes),
+				)
+				netLine += fmt.Sprintf(" | monthly RX %.1f MB, TX %.1f MB", bytesToMiB(monthlyRx), bytesToMiB(monthlyTx))
+				sections = append(sections, netLine+".")
 			}
 			if wantsProcesses && len(entry.ProcessStatuses) > 0 {
 				var offline []string
@@ -939,6 +1486,11 @@ func (c *ChatService) detectRegionCode(ctx context.Context, msgLower string) str
 	for _, r := range codes {
 		r = strings.ToLower(strings.TrimSpace(r))
 		if r == "" {
+			continue
+		}
+		// If a token is both a region code and a known project city code (e.g. "kcmo"),
+		// treat it as a city unless the user explicitly asked for a region.
+		if !strings.Contains(s, "region") && len(r) > 3 && c.isKnownProjectCityCode(ctx, r) {
 			continue
 		}
 		if strings.Contains(s, r) {
@@ -1470,8 +2022,12 @@ func (c *ChatService) handleTopPostersFromCity(ctx context.Context, req models.C
 		return models.ChatResponse{}, false, nil
 	}
 	city := c.detectCityCode(ctx, msgLower)
+	region := ""
 	if city == "" {
-		return models.ChatResponse{Answer: "Please specify a city code (for example: kcmo, kc, brt, dart)."}, true, nil
+		region = c.detectRegionCode(ctx, msgLower)
+		if region == "" {
+			return models.ChatResponse{Answer: "Please specify a city code (for example: kcmo, kc, brt, dart)."}, true, nil
+		}
 	}
 	if c.Gateway == nil {
 		return models.ChatResponse{Answer: "Tool gateway is not configured."}, true, nil
@@ -1480,7 +2036,19 @@ func (c *ChatService) handleTopPostersFromCity(ctx context.Context, req models.C
 	if strings.Contains(msgLower, "play") {
 		metric = "plays"
 	}
-	path := "/pop/stats?group_by=poster&metric=" + metric + "&order=top&limit=10&city=" + urlEscape(city)
+	limit := 10
+	if n := extractTopN(msgLower); n > 0 {
+		limit = n
+	}
+	path := "/pop/stats?group_by=poster&metric=" + metric + "&order=top&limit=" + fmt.Sprintf("%d", limit)
+	scopeLabel := ""
+	if region != "" {
+		path += "&region=" + urlEscape(region)
+		scopeLabel = region
+	} else {
+		path += "&city=" + urlEscape(city)
+		scopeLabel = city
+	}
 	status, body, err := c.Gateway.Get(path)
 	step := models.Step{Tool: "popStats", Status: status}
 	if err != nil {
@@ -1498,11 +2066,15 @@ func (c *ChatService) handleTopPostersFromCity(ctx context.Context, req models.C
 		_ = json.Unmarshal(body, &parsed)
 		itemsAny, _ := parsed["items"].([]any)
 		if len(itemsAny) == 0 {
-			answer = fmt.Sprintf("No poster %s stats found for city '%s'.", metric, city)
+			if region != "" {
+				answer = fmt.Sprintf("No poster %s stats found for region '%s'.", metric, scopeLabel)
+			} else {
+				answer = fmt.Sprintf("No poster %s stats found for city '%s'.", metric, scopeLabel)
+			}
 		} else {
 			lines := make([]string, 0, len(itemsAny))
 			for i, it := range itemsAny {
-				if i >= 10 {
+				if i >= limit {
 					break
 				}
 				row, ok := it.(map[string]any)
@@ -1525,7 +2097,11 @@ func (c *ChatService) handleTopPostersFromCity(ctx context.Context, req models.C
 				}
 				lines = append(lines, fmt.Sprintf("%d. %s — %.0f %s", len(lines)+1, name, val, metric))
 			}
-			answer = fmt.Sprintf("Top posters in %s by %s:\n%s", city, metric, strings.Join(lines, "\n"))
+			if region != "" {
+				answer = fmt.Sprintf("Top posters in %s by %s:\n%s", scopeLabel, metric, strings.Join(lines, "\n"))
+			} else {
+				answer = fmt.Sprintf("Top posters in %s by %s:\n%s", scopeLabel, metric, strings.Join(lines, "\n"))
+			}
 		}
 	}
 	if onToken != nil {
@@ -1546,8 +2122,12 @@ func (c *ChatService) handleTopDevicesFromCity(ctx context.Context, req models.C
 		return models.ChatResponse{}, false, nil
 	}
 	city := c.detectCityCode(ctx, msgLower)
+	region := ""
 	if city == "" {
-		return models.ChatResponse{Answer: "Please specify a city code (for example: kcmo, kc, brt, dart)."}, true, nil
+		region = c.detectRegionCode(ctx, msgLower)
+		if region == "" {
+			return models.ChatResponse{Answer: "Please specify a city code (for example: kcmo, kc, brt, dart)."}, true, nil
+		}
 	}
 	if c.Gateway == nil {
 		return models.ChatResponse{Answer: "Tool gateway is not configured."}, true, nil
@@ -1556,7 +2136,19 @@ func (c *ChatService) handleTopDevicesFromCity(ctx context.Context, req models.C
 	if strings.Contains(msgLower, "play") {
 		metric = "plays"
 	}
-	path := "/pop/stats?group_by=device&metric=" + metric + "&order=top&limit=10&city=" + urlEscape(city)
+	limit := 10
+	if n := extractTopN(msgLower); n > 0 {
+		limit = n
+	}
+	path := "/pop/stats?group_by=device&metric=" + metric + "&order=top&limit=" + fmt.Sprintf("%d", limit)
+	scopeLabel := ""
+	if region != "" {
+		path += "&region=" + urlEscape(region)
+		scopeLabel = region
+	} else {
+		path += "&city=" + urlEscape(city)
+		scopeLabel = city
+	}
 	status, body, err := c.Gateway.Get(path)
 	step := models.Step{Tool: "popStats", Status: status}
 	if err != nil {
@@ -1574,11 +2166,15 @@ func (c *ChatService) handleTopDevicesFromCity(ctx context.Context, req models.C
 		_ = json.Unmarshal(body, &parsed)
 		itemsAny, _ := parsed["items"].([]any)
 		if len(itemsAny) == 0 {
-			answer = fmt.Sprintf("No device %s stats found for city '%s'.", metric, city)
+			if region != "" {
+				answer = fmt.Sprintf("No device %s stats found for region '%s'.", metric, scopeLabel)
+			} else {
+				answer = fmt.Sprintf("No device %s stats found for city '%s'.", metric, scopeLabel)
+			}
 		} else {
 			lines := make([]string, 0, len(itemsAny))
 			for i, it := range itemsAny {
-				if i >= 10 {
+				if i >= limit {
 					break
 				}
 				row, ok := it.(map[string]any)
@@ -1598,7 +2194,7 @@ func (c *ChatService) handleTopDevicesFromCity(ctx context.Context, req models.C
 				}
 				lines = append(lines, fmt.Sprintf("%d. %s — %.0f %s", len(lines)+1, k, val, metric))
 			}
-			answer = fmt.Sprintf("Top devices in %s by %s:\n%s", city, metric, strings.Join(lines, "\n"))
+			answer = fmt.Sprintf("Top devices in %s by %s:\n%s", scopeLabel, metric, strings.Join(lines, "\n"))
 		}
 	}
 	if onToken != nil {
@@ -1765,8 +2361,9 @@ func (c *ChatService) prefetchImpressions(ctx context.Context, msg string) (*mod
 	// City ranking queries like "which city has most clicks" are answered by aggregating device click stats.
 	isCityMostClicks := (strings.Contains(msgLower, "city") && strings.Contains(msgLower, "click") && (strings.Contains(msgLower, "most") || strings.Contains(msgLower, "highest") || strings.Contains(msgLower, "top")))
 
-	cityCodeForQuery := c.detectCityCode(ctx, msgLower)
+	rawCityCode := c.detectCityCode(ctx, msgLower)
 	regionCodeForQuery := c.detectRegionCode(ctx, msgLower)
+	cityCodeForQuery, cityExplicit := normalizeCitySelection(rawCityCode, regionCodeForQuery, msgLower)
 	if strings.Contains(msgLower, "impression") {
 		campaignID := extractCampaignID(msg)
 		if campaignID != "" {
@@ -2126,7 +2723,8 @@ func (c *ChatService) prefetchImpressions(ctx context.Context, msg string) (*mod
 
 	// Add POP data prefetch
 	// Note: some user requests (e.g. "show brt stats") don't mention "pop" but still map to /pop/stats.
-	hasCityCode := c.detectCityCode(ctx, msgLower) != ""
+	cityCodeForQuery, cityExplicit = normalizeCitySelection(c.detectCityCode(ctx, msgLower), regionCodeForQuery, msgLower)
+	hasCityCode := cityCodeForQuery != ""
 	hasRegionCode := regionCodeForQuery != ""
 	if strings.Contains(msgLower, "pop") ||
 		(strings.Contains(msgLower, "device") && (strings.Contains(msgLower, "click") || strings.Contains(msgLower, "most") || strings.Contains(msgLower, "more"))) ||
@@ -2183,9 +2781,8 @@ func (c *ChatService) prefetchImpressions(ctx context.Context, msg string) (*mod
 			// City vs region targeting.
 			useRegionForStats := false
 			if regionCodeForQuery != "" {
-				// If we couldn't detect a city code (i.e. "brt" is not a city), use region.
-				// If the user explicitly says "region", also use region.
-				if strings.Contains(msgLower, "region") || cityCodeForQuery == "" {
+				// Prefer region when no city detected, user explicitly says region, or city/region tokens are identical (e.g. "brt").
+				if strings.Contains(msgLower, "region") || !cityExplicit || strings.EqualFold(regionCodeForQuery, cityCodeForQuery) {
 					useRegionForStats = true
 				}
 			}
@@ -2245,41 +2842,6 @@ func (c *ChatService) prefetchImpressions(ctx context.Context, msg string) (*mod
 					}
 
 					// Region fallback: if stats are empty and we have a region code (e.g. brt), retry with region.
-					itemsAny, hasItemsAny := parsed["items"]
-					emptyAny := false
-					if !hasItemsAny || itemsAny == nil {
-						emptyAny = true
-					} else if slice, ok := itemsAny.([]interface{}); ok {
-						if len(slice) == 0 {
-							emptyAny = true
-						}
-					}
-					if emptyAny && !useRegionForStats && regionCodeForQuery != "" {
-						regionPath := statsQueryPath
-						if cityCodeForQuery != "" {
-							regionPath = strings.Replace(regionPath, "&city="+cityCodeForQuery, "&region="+regionCodeForQuery, 1)
-						} else {
-							regionPath += "&region=" + regionCodeForQuery
-						}
-						debugLogf("gateway GET %s", regionPath)
-						statusR, bodyR, errR := c.Gateway.Get(regionPath)
-						debugLogf("gateway GET %s -> status=%d err=%v", regionPath, statusR, errR)
-						stepR := models.Step{Tool: "popStats", Status: statusR}
-						if errR != nil {
-							stepR.Error = errR.Error()
-						} else {
-							stepR.Body = clipString(strings.TrimSpace(string(bodyR)), 2000)
-						}
-						steps = append(steps, stepR)
-						if errR == nil && statusR >= 200 && statusR < 300 {
-							var parsedR map[string]any
-							if json.Unmarshal(bodyR, &parsedR) == nil {
-								parsed = parsedR
-								useRegionForStats = true
-							}
-						}
-					}
-
 					// If the user asked for city ranking by clicks, aggregate device stats into city totals.
 					if isCityMostClicks {
 						cityTotals := map[string]float64{}
@@ -2395,6 +2957,10 @@ func (c *ChatService) prefetchImpressions(ctx context.Context, msg string) (*mod
 						}
 						toolData["pop_stats"] = emptyNote
 					} else {
+						// Clear any stale empty markers once we have data.
+						if toolData != nil {
+							delete(toolData, "empty_data")
+						}
 						toolData["pop_stats"] = parsed
 					}
 				}
@@ -2485,10 +3051,10 @@ func (c *ChatService) Chat(ctx context.Context, ownerKey string, req models.Chat
 	if resp, handled, err := c.handleTopDevicesFromCity(ctx, req, nil); handled {
 		return resp, err
 	}
-	if resp, handled, err := c.handleDeviceTelemetry(ctx, req, nil); handled {
+	if resp, handled, err := c.handleKioskCountFromCity(ctx, req, nil); handled {
 		return resp, err
 	}
-	if resp, handled, err := c.handleKioskCountFromCity(ctx, req, nil); handled {
+	if resp, handled, err := c.handleDeviceTelemetry(ctx, req, nil); handled {
 		return resp, err
 	}
 	if resp, handled, err := c.handleCreativeUpload(ctx, ownerKey, req); handled {
@@ -2697,10 +3263,10 @@ func (c *ChatService) ChatStream(ctx context.Context, ownerKey string, req model
 	if resp, handled, err := c.handleTopDevicesFromCity(ctx, req, onToken); handled {
 		return resp, err
 	}
-	if resp, handled, err := c.handleDeviceTelemetry(ctx, req, onToken); handled {
+	if resp, handled, err := c.handleKioskCountFromCity(ctx, req, onToken); handled {
 		return resp, err
 	}
-	if resp, handled, err := c.handleKioskCountFromCity(ctx, req, onToken); handled {
+	if resp, handled, err := c.handleDeviceTelemetry(ctx, req, onToken); handled {
 		return resp, err
 	}
 	if resp, handled, err := c.handleCreativeUpload(ctx, ownerKey, req); handled {

@@ -144,7 +144,7 @@ Events:
 
 
 export PORT=8091
-export DATABASE_URL="postgres://postgres:<password>@localhost:5432/openai_agent_service?sslmode=disable"
+export DATABASE_URL="postgres://postgres:asterisk@localhost:5432/openai_agent_service?sslmode=disable"
 export TOOL_GATEWAY_BASE_URL="https://tool-gateway.citypost.us"
 export TOOL_GATEWAY_API_KEY="<tool-gateway-api-key>"
 export OPENAI_API_KEY="<openai-api-key>"
