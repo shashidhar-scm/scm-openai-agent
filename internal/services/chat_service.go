@@ -24,6 +24,1738 @@ func debugEnabled() bool {
 	return v == "debug" || v == "1" || v == "true"
 }
 
+func (c *ChatService) handlePosterAnalyticsByID(ctx context.Context, req models.ChatRequest, onToken func(string)) (models.ChatResponse, bool, error) {
+	msgLower := strings.ToLower(req.Message)
+	if !strings.Contains(msgLower, "analytics") {
+		return models.ChatResponse{}, false, nil
+	}
+	if !strings.Contains(msgLower, "poster") {
+		return models.ChatResponse{}, false, nil
+	}
+	posterID := extractCampaignID(req.Message)
+	if !looksLikeUUID(posterID) {
+		return models.ChatResponse{}, false, nil
+	}
+	if c.Gateway == nil {
+		return models.ChatResponse{Answer: "Tool gateway is not configured."}, true, nil
+	}
+
+	conversationID := strings.TrimSpace(req.ConversationID)
+	city := c.detectCityCode(ctx, msgLower)
+	region := c.detectRegionCode(ctx, msgLower)
+	if city == "" && region == "" && conversationID != "" {
+		if st := c.getConversationState(conversationID); st != nil {
+			if strings.TrimSpace(st.PosterRegion) != "" {
+				region = strings.ToLower(strings.TrimSpace(st.PosterRegion))
+			}
+			if strings.TrimSpace(st.PosterCity) != "" {
+				city = strings.ToLower(strings.TrimSpace(st.PosterCity))
+			}
+			if region == "" && strings.TrimSpace(st.Region) != "" {
+				region = strings.ToLower(strings.TrimSpace(st.Region))
+			}
+			if city == "" && strings.TrimSpace(st.City) != "" {
+				city = strings.ToLower(strings.TrimSpace(st.City))
+			}
+		}
+	}
+
+	type popItem struct {
+		PosterName string    `json:"poster_name"`
+		PosterID   string    `json:"poster_id"`
+		HostName   string    `json:"host_name"`
+		KioskName  string    `json:"kiosk_name"`
+		PopTime    time.Time `json:"pop_datetime"`
+		City       string    `json:"city"`
+		Region     string    `json:"region"`
+		PlayCount  int64     `json:"play_count"`
+	}
+	type popListResponse struct {
+		Items    []popItem `json:"items"`
+		Total    int64     `json:"total"`
+		Page     int       `json:"page"`
+		PageSize int       `json:"page_size"`
+	}
+
+	page := 1
+	pageSize := 200
+	maxPages := 10
+	steps := make([]models.Step, 0, 2)
+	items := make([]popItem, 0, 64)
+	for {
+		path := fmt.Sprintf("/pop?poster_id=%s&page=%d&page_size=%d", urlEscape(posterID), page, pageSize)
+		if strings.TrimSpace(region) != "" {
+			path += "&region=" + urlEscape(region)
+		} else if strings.TrimSpace(city) != "" {
+			path += "&city=" + urlEscape(city)
+		}
+		status, body, err := c.Gateway.Get(path)
+		step := models.Step{Tool: "popList", Status: status}
+		if err != nil {
+			step.Error = err.Error()
+		} else {
+			step.Body = clipString(strings.TrimSpace(string(body)), 2000)
+		}
+		steps = append(steps, step)
+		if err != nil {
+			return models.ChatResponse{Answer: "Failed to fetch POP data: " + err.Error(), Steps: steps}, true, nil
+		}
+		if status < 200 || status >= 300 {
+			return models.ChatResponse{Answer: fmt.Sprintf("Failed to fetch POP data (status %d).", status), Steps: steps}, true, nil
+		}
+		var resp popListResponse
+		if json.Unmarshal(body, &resp) != nil {
+			return models.ChatResponse{Answer: "POP list response could not be parsed.", Steps: steps}, true, nil
+		}
+		if len(resp.Items) == 0 {
+			break
+		}
+		items = append(items, resp.Items...)
+		if resp.Total > 0 {
+			if int64(page*pageSize) >= resp.Total {
+				break
+			}
+		} else if len(resp.Items) < pageSize {
+			break
+		}
+		page++
+		if page > maxPages {
+			break
+		}
+	}
+	if len(items) == 0 {
+		return models.ChatResponse{Answer: fmt.Sprintf("No POP rows found for poster %s.", posterID), Steps: steps}, true, nil
+	}
+
+	posterName := strings.TrimSpace(items[0].PosterName)
+	label := posterID
+	if posterName != "" {
+		label = posterName + " (" + posterID + ")"
+	}
+	scopeLabel := ""
+	if strings.TrimSpace(region) != "" {
+		scopeLabel = "region '" + strings.TrimSpace(region) + "'"
+	} else if strings.TrimSpace(city) != "" {
+		scopeLabel = "city '" + strings.TrimSpace(city) + "'"
+	}
+
+	totalPlays := int64(0)
+	byKiosk := map[string]int64{}
+	for _, it := range items {
+		totalPlays += it.PlayCount
+		k := strings.TrimSpace(it.KioskName)
+		if k == "" {
+			k = strings.TrimSpace(it.HostName)
+		}
+		if k == "" {
+			continue
+		}
+		byKiosk[k] += it.PlayCount
+	}
+
+	type kv struct {
+		Key   string
+		Plays int64
+	}
+	rows := make([]kv, 0, len(byKiosk))
+	for k, v := range byKiosk {
+		rows = append(rows, kv{Key: k, Plays: v})
+	}
+	sort.Slice(rows, func(i, j int) bool { return rows[i].Plays > rows[j].Plays })
+	if len(rows) > 10 {
+		rows = rows[:10]
+	}
+	lines := make([]string, 0, len(rows)+3)
+	if scopeLabel != "" {
+		lines = append(lines, fmt.Sprintf("Analytics for poster %s in %s: %d plays", label, scopeLabel, totalPlays))
+	} else {
+		lines = append(lines, fmt.Sprintf("Analytics for poster %s: %d plays", label, totalPlays))
+	}
+	lines = append(lines, fmt.Sprintf("Kiosks matched: %d", len(byKiosk)))
+	lines = append(lines, "Top kiosks:")
+	for i, r := range rows {
+		lines = append(lines, fmt.Sprintf("%d. %s — %d plays", i+1, r.Key, r.Plays))
+	}
+	answer := strings.Join(lines, "\n")
+	if onToken != nil {
+		onToken(answer)
+	}
+	if conversationID != "" {
+		c.updateConversationPoster(conversationID, posterName, city, region)
+		c.updateConversationPosterID(conversationID, posterID)
+		c.clearPending(conversationID)
+	}
+	return models.ChatResponse{Answer: answer, Steps: steps}, true, nil
+}
+
+func (c *ChatService) handleCampaignCreatives(ctx context.Context, req models.ChatRequest, onToken func(string)) (models.ChatResponse, bool, error) {
+	msg := strings.TrimSpace(req.Message)
+	msgLower := strings.ToLower(msg)
+	if msg == "" {
+		return models.ChatResponse{}, false, nil
+	}
+	if !(strings.Contains(msgLower, "creative") || strings.Contains(msgLower, "creatives")) {
+		return models.ChatResponse{}, false, nil
+	}
+	if !(strings.Contains(msgLower, "campaign") || strings.Contains(msgLower, "campaigns")) {
+		return models.ChatResponse{}, false, nil
+	}
+	if strings.Contains(msgLower, "upload") {
+		return models.ChatResponse{}, false, nil
+	}
+	if !(strings.Contains(msgLower, "show") || strings.Contains(msgLower, "list") || strings.Contains(msgLower, "get")) {
+		return models.ChatResponse{}, false, nil
+	}
+	if c.Gateway == nil {
+		return models.ChatResponse{Answer: "Tool gateway is not configured."}, true, nil
+	}
+
+	conversationID := strings.TrimSpace(req.ConversationID)
+
+	campaignID := ""
+	if strings.Contains(msgLower, "campaign") {
+		campaignID = extractCampaignID(msg)
+	}
+
+	// Parse a campaign name from phrases like:
+	// "show Bet 365 campaign creatives"
+	// "list creatives for Bet 365 campaign"
+	campaignName := ""
+	if campaignID == "" {
+		if strings.Contains(msgLower, "campaign") {
+			beforeCampaign := strings.TrimSpace(strings.SplitN(msg, "campaign", 2)[0])
+			beforeCampaignLower := strings.ToLower(beforeCampaign)
+			for _, w := range []string{"show", "list", "get", "me", "the", "all", "for", "of", "creatives", "creative"} {
+				beforeCampaignLower = strings.ReplaceAll(beforeCampaignLower, w, " ")
+			}
+			campaignName = strings.TrimSpace(strings.Join(strings.Fields(beforeCampaignLower), " "))
+		}
+		if campaignName == "" {
+			// Fallback: try to extract text between "for" and "campaign".
+			if strings.Contains(msgLower, " for ") && strings.Contains(msgLower, "campaign") {
+				parts := strings.SplitN(msgLower, " for ", 2)
+				if len(parts) == 2 {
+					candidate := strings.TrimSpace(strings.SplitN(parts[1], "campaign", 2)[0])
+					campaignName = strings.TrimSpace(candidate)
+				}
+			}
+		}
+	}
+
+	steps := make([]models.Step, 0, 2)
+	if campaignID == "" {
+		if strings.TrimSpace(campaignName) == "" {
+			return models.ChatResponse{Answer: "Please specify a campaign name (for example: show Bet 365 campaign creatives) or provide a campaign id."}, true, nil
+		}
+		status, body, err := c.Gateway.Get("/ads/campaigns/search?query=" + urlEscape(campaignName) + "&page=1&page_size=20")
+		step := models.Step{Tool: "adsCampaignsSearch", Status: status}
+		if err != nil {
+			step.Error = err.Error()
+		} else {
+			step.Body = clipString(strings.TrimSpace(string(body)), 2000)
+		}
+		steps = append(steps, step)
+		if err != nil {
+			return models.ChatResponse{Answer: "Failed to search campaigns: " + err.Error(), Steps: steps}, true, nil
+		}
+		if status < 200 || status >= 300 {
+			return models.ChatResponse{Answer: fmt.Sprintf("Failed to search campaigns (status %d).", status), Steps: steps}, true, nil
+		}
+		var parsed map[string]any
+		if json.Unmarshal(body, &parsed) != nil {
+			return models.ChatResponse{Answer: "Campaign search response could not be parsed.", Steps: steps}, true, nil
+		}
+		rows := extractCampaignRows(parsed)
+		bestID := ""
+		bestName := ""
+		q := strings.ToLower(strings.TrimSpace(campaignName))
+		for _, it := range rows {
+			m, ok := it.(map[string]any)
+			if !ok {
+				continue
+			}
+			id, _ := m["id"].(string)
+			name, _ := m["name"].(string)
+			id = strings.TrimSpace(id)
+			name = strings.TrimSpace(name)
+			if id == "" || name == "" {
+				continue
+			}
+			nameLower := strings.ToLower(name)
+			if nameLower == q || strings.Contains(nameLower, q) {
+				bestID = id
+				bestName = name
+				break
+			}
+		}
+		if bestID == "" {
+			// Fall back to first row.
+			if len(rows) > 0 {
+				if m, ok := rows[0].(map[string]any); ok {
+					bestID, _ = m["id"].(string)
+					bestName, _ = m["name"].(string)
+					bestID = strings.TrimSpace(bestID)
+					bestName = strings.TrimSpace(bestName)
+				}
+			}
+		}
+		if bestID == "" {
+			return models.ChatResponse{Answer: fmt.Sprintf("No campaigns found matching '%s'.", campaignName), Steps: steps}, true, nil
+		}
+		campaignID = bestID
+		if conversationID != "" {
+			c.updateConversationCampaignID(conversationID, campaignID)
+		}
+		_ = bestName
+	}
+
+	path := "/ads/creatives/campaign/" + urlEscape(campaignID) + "?page=1&page_size=200"
+	statusC, bodyC, errC := c.Gateway.Get(path)
+	stepC := models.Step{Tool: "adsCreativesByCampaign", Status: statusC}
+	if errC != nil {
+		stepC.Error = errC.Error()
+	} else {
+		stepC.Body = clipString(strings.TrimSpace(string(bodyC)), 2000)
+	}
+	steps = append(steps, stepC)
+	if errC != nil {
+		return models.ChatResponse{Answer: "Failed to fetch campaign creatives: " + errC.Error(), Steps: steps}, true, nil
+	}
+	if statusC < 200 || statusC >= 300 {
+		return models.ChatResponse{Answer: fmt.Sprintf("Failed to fetch campaign creatives (status %d).", statusC), Steps: steps}, true, nil
+	}
+	rows := parseRows(bodyC)
+	if len(rows) == 0 {
+		return models.ChatResponse{Answer: fmt.Sprintf("No creatives found for campaign %s.", campaignID), Steps: steps}, true, nil
+	}
+
+	lines := make([]string, 0, 12)
+	lines = append(lines, fmt.Sprintf("Creatives for campaign %s:", campaignID))
+	limit := 10
+	for _, it := range rows {
+		if len(lines)-1 >= limit {
+			break
+		}
+		m, ok := it.(map[string]any)
+		if !ok {
+			continue
+		}
+		id := ""
+		switch v := m["id"].(type) {
+		case string:
+			id = v
+		case float64:
+			id = strconv.Itoa(int(v))
+		}
+		name, _ := m["name"].(string)
+		typeStr, _ := m["type"].(string)
+		fileURL, _ := m["file_url"].(string)
+		if strings.TrimSpace(fileURL) == "" {
+			fileURL, _ = m["fileUrl"].(string)
+		}
+		name = strings.TrimSpace(name)
+		id = strings.TrimSpace(id)
+		typeStr = strings.TrimSpace(typeStr)
+		if name == "" && id == "" {
+			continue
+		}
+		label := name
+		if label == "" {
+			label = id
+		}
+		if typeStr != "" {
+			label += " — " + typeStr
+		}
+		if strings.TrimSpace(fileURL) != "" {
+			label += " — " + strings.TrimSpace(fileURL)
+		}
+		lines = append(lines, fmt.Sprintf("%d. %s", len(lines), label))
+	}
+	answer := strings.Join(lines, "\n")
+	if onToken != nil {
+		onToken(answer)
+	}
+	return models.ChatResponse{Answer: answer, Steps: steps}, true, nil
+}
+
+func (c *ChatService) handleKioskPosterPlayCount(ctx context.Context, req models.ChatRequest, onToken func(string)) (models.ChatResponse, bool, error) {
+	msgLower := strings.ToLower(req.Message)
+	if !(strings.Contains(msgLower, "played") || strings.Contains(msgLower, "play")) {
+		return models.ChatResponse{}, false, nil
+	}
+	if !strings.Contains(msgLower, "poster") {
+		return models.ChatResponse{}, false, nil
+	}
+	if !(strings.Contains(msgLower, "kiosk") || strings.Contains(msgLower, "device")) {
+		return models.ChatResponse{}, false, nil
+	}
+	if c.Gateway == nil {
+		return models.ChatResponse{Answer: "Tool gateway is not configured."}, true, nil
+	}
+
+	type popItem struct {
+		PosterName string `json:"poster_name"`
+		PosterID   string `json:"poster_id"`
+		HostName   string `json:"host_name"`
+		KioskName  string `json:"kiosk_name"`
+		PlayCount  int64  `json:"play_count"`
+	}
+	type popListResponse struct {
+		Items    []popItem `json:"items"`
+		Total    int64     `json:"total"`
+		Page     int       `json:"page"`
+		PageSize int       `json:"page_size"`
+	}
+
+	conversationID := strings.TrimSpace(req.ConversationID)
+	low := strings.ToLower(req.Message)
+	playedIdx := strings.Index(low, " has played ")
+	if playedIdx < 0 {
+		playedIdx = strings.Index(low, " played ")
+	}
+	if playedIdx < 0 {
+		return models.ChatResponse{}, false, nil
+	}
+	kioskName := strings.TrimSpace(req.Message[:playedIdx])
+	// Strip common leading question prefixes so we don't feed "How much ..." into device search.
+	{
+		knLower := strings.ToLower(strings.TrimSpace(kioskName))
+		prefixes := []string{"how much ", "how many ", "what is ", "what's ", "whats ", "tell me ", "show me ", "give me "}
+		for _, p := range prefixes {
+			if strings.HasPrefix(knLower, p) {
+				kioskName = strings.TrimSpace(kioskName[len(p):])
+				knLower = strings.ToLower(strings.TrimSpace(kioskName))
+				break
+			}
+		}
+	}
+	if kioskName == "" {
+		return models.ChatResponse{}, false, nil
+	}
+
+	rest := strings.TrimSpace(req.Message[playedIdx:])
+	restLow := strings.ToLower(rest)
+	hasPlayedPrefix := " has played "
+	if j := strings.Index(restLow, hasPlayedPrefix); j >= 0 {
+		rest = strings.TrimSpace(rest[j+len(hasPlayedPrefix):])
+	} else if j := strings.Index(restLow, " played "); j >= 0 {
+		rest = strings.TrimSpace(rest[j+len(" played "):])
+	}
+	posterEndIdx := strings.Index(strings.ToLower(rest), " poster")
+	posterName := rest
+	if posterEndIdx >= 0 {
+		posterName = strings.TrimSpace(rest[:posterEndIdx])
+	}
+	posterName = strings.TrimSpace(strings.Trim(posterName, "\"' "))
+	if posterName == "" {
+		if conversationID != "" {
+			if st := c.getConversationState(conversationID); st != nil {
+				if strings.TrimSpace(st.PosterName) != "" {
+					posterName = strings.TrimSpace(st.PosterName)
+				}
+			}
+		}
+	}
+	if posterName == "" {
+		return models.ChatResponse{Answer: "Please specify a poster name."}, true, nil
+	}
+
+	resolvedHost, resolveStep := c.resolveHostFromDeviceName(ctx, conversationID, kioskName)
+	resolvedHost = strings.ToLower(strings.TrimSpace(resolvedHost))
+	if resolvedHost == "" {
+		// Fallback: try direct POP filtering by kiosk name first; then query by poster_name + scope and filter by kiosk_name.
+		steps := make([]models.Step, 0, 2)
+		if resolveStep != nil {
+			steps = append(steps, *resolveStep)
+		}
+		city := ""
+		region := ""
+		if conversationID != "" {
+			if st := c.getConversationState(conversationID); st != nil {
+				if strings.TrimSpace(st.PosterRegion) != "" {
+					region = strings.ToLower(strings.TrimSpace(st.PosterRegion))
+				}
+				if strings.TrimSpace(st.PosterCity) != "" {
+					city = strings.ToLower(strings.TrimSpace(st.PosterCity))
+				}
+				if region == "" && strings.TrimSpace(st.Region) != "" {
+					region = strings.ToLower(strings.TrimSpace(st.Region))
+				}
+				if city == "" && strings.TrimSpace(st.City) != "" {
+					city = strings.ToLower(strings.TrimSpace(st.City))
+				}
+			}
+		}
+
+		page := 1
+		pageSize := 200
+		maxPages := 10
+		matchedPlays := int64(0)
+		matched := 0
+		posterIDFound := ""
+		kioskLower := strings.ToLower(strings.TrimSpace(kioskName))
+
+		// Attempt server-side filtering when supported.
+		{
+			path := fmt.Sprintf("/pop?poster_name=%s&kiosk_name=%s&page=1&page_size=%d", urlEscape(posterName), urlEscape(kioskName), pageSize)
+			if strings.TrimSpace(region) != "" {
+				path += "&region=" + urlEscape(region)
+			} else if strings.TrimSpace(city) != "" {
+				path += "&city=" + urlEscape(city)
+			}
+			status, body, err := c.Gateway.Get(path)
+			step := models.Step{Tool: "popList", Status: status}
+			if err != nil {
+				step.Error = err.Error()
+			} else {
+				step.Body = clipString(strings.TrimSpace(string(body)), 2000)
+			}
+			steps = append(steps, step)
+			if err == nil && status == 400 {
+				path2 := fmt.Sprintf("/pop?poster_name=%s&kiosk=%s&page=1&page_size=%d", urlEscape(posterName), urlEscape(kioskName), pageSize)
+				if strings.TrimSpace(region) != "" {
+					path2 += "&region=" + urlEscape(region)
+				} else if strings.TrimSpace(city) != "" {
+					path2 += "&city=" + urlEscape(city)
+				}
+				status2, body2, err2 := c.Gateway.Get(path2)
+				step2 := models.Step{Tool: "popList", Status: status2}
+				if err2 != nil {
+					step2.Error = err2.Error()
+				} else {
+					step2.Body = clipString(strings.TrimSpace(string(body2)), 2000)
+				}
+				steps = append(steps, step2)
+				status, body, err = status2, body2, err2
+			}
+			if err == nil && status >= 200 && status < 300 {
+				var resp popListResponse
+				if json.Unmarshal(body, &resp) == nil {
+					if len(resp.Items) > 0 {
+						total := int64(0)
+						for _, it := range resp.Items {
+							// Still double-check kiosk match just in case the server-side filter is fuzzy.
+							kn := strings.ToLower(strings.TrimSpace(it.KioskName))
+							if kn == "" {
+								continue
+							}
+							if kn == kioskLower || strings.Contains(kn, kioskLower) || strings.Contains(kioskLower, kn) {
+								total += it.PlayCount
+							}
+						}
+						if total > 0 {
+							scope := ""
+							if region != "" {
+								scope = " in region '" + region + "'"
+							} else if city != "" {
+								scope = " in city '" + city + "'"
+							}
+							answer := fmt.Sprintf("Kiosk '%s'%s has played poster '%s': %d plays.", kioskName, scope, posterName, total)
+							if onToken != nil {
+								onToken(answer)
+							}
+							return models.ChatResponse{Answer: answer, Steps: steps}, true, nil
+						}
+					}
+				}
+			}
+		}
+		for {
+			path := fmt.Sprintf("/pop?poster_name=%s&page=%d&page_size=%d", urlEscape(posterName), page, pageSize)
+			if strings.TrimSpace(region) != "" {
+				path += "&region=" + urlEscape(region)
+			} else if strings.TrimSpace(city) != "" {
+				path += "&city=" + urlEscape(city)
+			}
+			status, body, err := c.Gateway.Get(path)
+			step := models.Step{Tool: "popList", Status: status}
+			if err != nil {
+				step.Error = err.Error()
+			} else {
+				step.Body = clipString(strings.TrimSpace(string(body)), 2000)
+			}
+			steps = append(steps, step)
+			if err != nil {
+				return models.ChatResponse{Answer: "Failed to fetch POP data: " + err.Error(), Steps: steps}, true, nil
+			}
+			if status < 200 || status >= 300 {
+				break
+			}
+			var resp popListResponse
+			if json.Unmarshal(body, &resp) != nil {
+				break
+			}
+			if len(resp.Items) == 0 {
+				break
+			}
+			for _, it := range resp.Items {
+				kn := strings.ToLower(strings.TrimSpace(it.KioskName))
+				if kn == "" {
+					continue
+				}
+				if kn == kioskLower || strings.Contains(kn, kioskLower) || strings.Contains(kioskLower, kn) {
+					matchedPlays += it.PlayCount
+					matched++
+					if posterIDFound == "" && looksLikeUUID(it.PosterID) {
+						posterIDFound = it.PosterID
+					}
+				}
+			}
+			if resp.Total > 0 {
+				if int64(page*pageSize) >= resp.Total {
+					break
+				}
+			} else if len(resp.Items) < pageSize {
+				break
+			}
+			page++
+			if page > maxPages {
+				break
+			}
+		}
+		if matched == 0 {
+			return models.ChatResponse{Answer: "I couldn't resolve that kiosk name to a host, and I couldn't find matching POP rows by kiosk name. Please provide the server/host name.", Steps: steps}, true, nil
+		}
+		scope := ""
+		if region != "" {
+			scope = " in region '" + region + "'"
+		} else if city != "" {
+			scope = " in city '" + city + "'"
+		}
+		answer := fmt.Sprintf("Kiosk '%s'%s has played poster '%s': %d plays.", kioskName, scope, posterName, matchedPlays)
+		if onToken != nil {
+			onToken(answer)
+		}
+		if conversationID != "" {
+			c.updateConversationPoster(conversationID, posterName, city, region)
+			c.updateConversationPosterID(conversationID, posterIDFound)
+			c.clearPending(conversationID)
+		}
+		return models.ChatResponse{Answer: answer, Steps: steps}, true, nil
+	}
+
+	page := 1
+	pageSize := 200
+	maxPages := 10
+	steps := make([]models.Step, 0, 2)
+	if resolveStep != nil {
+		steps = append(steps, *resolveStep)
+	}
+	items := make([]popItem, 0, 64)
+	for {
+		path := fmt.Sprintf("/pop?poster_name=%s&host_name=%s&page=%d&page_size=%d", urlEscape(posterName), urlEscape(resolvedHost), page, pageSize)
+		status, body, err := c.Gateway.Get(path)
+		if err == nil && status == 400 {
+			path2 := fmt.Sprintf("/pop?poster_name=%s&host=%s&page=%d&page_size=%d", urlEscape(posterName), urlEscape(resolvedHost), page, pageSize)
+			status2, body2, err2 := c.Gateway.Get(path2)
+			step2 := models.Step{Tool: "popList", Status: status2}
+			if err2 != nil {
+				step2.Error = err2.Error()
+			} else {
+				step2.Body = clipString(strings.TrimSpace(string(body2)), 2000)
+			}
+			steps = append(steps, step2)
+			status, body, err = status2, body2, err2
+		}
+		step := models.Step{Tool: "popList", Status: status}
+		if err != nil {
+			step.Error = err.Error()
+		} else {
+			step.Body = clipString(strings.TrimSpace(string(body)), 2000)
+		}
+		steps = append(steps, step)
+		if err != nil {
+			return models.ChatResponse{Answer: "Failed to fetch POP data: " + err.Error(), Steps: steps}, true, nil
+		}
+		if status < 200 || status >= 300 {
+			return models.ChatResponse{Answer: fmt.Sprintf("Failed to fetch POP data (status %d).", status), Steps: steps}, true, nil
+		}
+		var resp popListResponse
+		if json.Unmarshal(body, &resp) != nil {
+			return models.ChatResponse{Answer: "POP list response could not be parsed.", Steps: steps}, true, nil
+		}
+		if len(resp.Items) == 0 {
+			break
+		}
+		items = append(items, resp.Items...)
+		if resp.Total > 0 {
+			if int64(page*pageSize) >= resp.Total {
+				break
+			}
+		} else if len(resp.Items) < pageSize {
+			break
+		}
+		page++
+		if page > maxPages {
+			break
+		}
+	}
+
+	if len(items) == 0 {
+		answer := fmt.Sprintf("No play counts found for poster '%s' on kiosk '%s'.", posterName, kioskName)
+		if onToken != nil {
+			onToken(answer)
+		}
+		return models.ChatResponse{Answer: answer, Steps: steps}, true, nil
+	}
+
+	totalPlays := int64(0)
+	for _, it := range items {
+		totalPlays += it.PlayCount
+	}
+	answer := fmt.Sprintf("Kiosk '%s' (%s) has played poster '%s': %d plays.", kioskName, resolvedHost, posterName, totalPlays)
+	if onToken != nil {
+		onToken(answer)
+	}
+	if conversationID != "" {
+		c.updateConversationPoster(conversationID, posterName, "", "")
+		c.updateConversationHost(conversationID, resolvedHost)
+		c.clearPending(conversationID)
+	}
+	return models.ChatResponse{Answer: answer, Steps: steps}, true, nil
+}
+
+func extractNaturalDateRangeRFC3339(msg string) (string, string) {
+	s := strings.ToLower(strings.TrimSpace(msg))
+	if s == "" {
+		return "", ""
+	}
+	idx := strings.Index(s, "from ")
+	if idx < 0 {
+		return "", ""
+	}
+	rest := strings.TrimSpace(s[idx+5:])
+	endIdx := -1
+	for _, sep := range []string{" till ", " to "} {
+		if j := strings.Index(rest, sep); j >= 0 {
+			endIdx = j
+			break
+		}
+	}
+	if endIdx < 0 {
+		return "", ""
+	}
+	fromPart := strings.TrimSpace(rest[:endIdx])
+	toPart := strings.TrimSpace(rest[endIdx:])
+	toPart = strings.TrimSpace(strings.TrimPrefix(toPart, "till"))
+	toPart = strings.TrimSpace(strings.TrimPrefix(toPart, "to"))
+	toPart = strings.TrimSpace(toPart)
+
+	fromPart = strings.ReplaceAll(fromPart, ",", " ")
+	fromPart = strings.ReplaceAll(fromPart, "st", "")
+	fromPart = strings.ReplaceAll(fromPart, "nd", "")
+	fromPart = strings.ReplaceAll(fromPart, "rd", "")
+	fromPart = strings.ReplaceAll(fromPart, "th", "")
+	fromPart = strings.Join(strings.Fields(fromPart), " ")
+
+	fromT, err := time.Parse("january 2 2006", fromPart)
+	if err != nil {
+		fromT, err = time.Parse("jan 2 2006", fromPart)
+		if err != nil {
+			return "", ""
+		}
+	}
+	from := time.Date(fromT.Year(), fromT.Month(), fromT.Day(), 0, 0, 0, 0, time.UTC)
+
+	var to time.Time
+	toPart = strings.ReplaceAll(toPart, ",", " ")
+	toPart = strings.Join(strings.Fields(toPart), " ")
+	if strings.Contains(toPart, "today") {
+		now := time.Now().UTC()
+		to = time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC).AddDate(0, 0, 1)
+	} else {
+		toPart = strings.ReplaceAll(toPart, "st", "")
+		toPart = strings.ReplaceAll(toPart, "nd", "")
+		toPart = strings.ReplaceAll(toPart, "rd", "")
+		toPart = strings.ReplaceAll(toPart, "th", "")
+		toPart = strings.Join(strings.Fields(toPart), " ")
+		toT, err2 := time.Parse("january 2 2006", toPart)
+		if err2 != nil {
+			toT, err2 = time.Parse("jan 2 2006", toPart)
+			if err2 != nil {
+				return "", ""
+			}
+		}
+		to = time.Date(toT.Year(), toT.Month(), toT.Day(), 0, 0, 0, 0, time.UTC).AddDate(0, 0, 1)
+	}
+	if !from.Before(to) {
+		return "", ""
+	}
+	return from.Format(time.RFC3339), to.Format(time.RFC3339)
+}
+
+func (c *ChatService) handlePopForPosterID(ctx context.Context, req models.ChatRequest, onToken func(string)) (models.ChatResponse, bool, error) {
+	msgLower := strings.ToLower(req.Message)
+	if !strings.Contains(msgLower, "pop") {
+		return models.ChatResponse{}, false, nil
+	}
+	if !strings.Contains(msgLower, "poster") {
+		return models.ChatResponse{}, false, nil
+	}
+	posterID := extractCampaignID(req.Message)
+	if !looksLikeUUID(posterID) {
+		return models.ChatResponse{}, false, nil
+	}
+	if c.Gateway == nil {
+		return models.ChatResponse{Answer: "Tool gateway is not configured."}, true, nil
+	}
+
+	conversationID := strings.TrimSpace(req.ConversationID)
+	isKioskWise := strings.Contains(msgLower, "kiosk wise") || strings.Contains(msgLower, "kiosk-wise") || strings.Contains(msgLower, "kioskwise") || strings.Contains(msgLower, "by kiosk")
+
+	city := c.detectCityCode(ctx, msgLower)
+	region := c.detectRegionCode(ctx, msgLower)
+	if city == "" && region == "" && conversationID != "" {
+		if st := c.getConversationState(conversationID); st != nil {
+			if strings.TrimSpace(st.PosterRegion) != "" {
+				region = strings.ToLower(strings.TrimSpace(st.PosterRegion))
+			}
+			if strings.TrimSpace(st.PosterCity) != "" {
+				city = strings.ToLower(strings.TrimSpace(st.PosterCity))
+			}
+			if region == "" && strings.TrimSpace(st.Region) != "" {
+				region = strings.ToLower(strings.TrimSpace(st.Region))
+			}
+			if city == "" && strings.TrimSpace(st.City) != "" {
+				city = strings.ToLower(strings.TrimSpace(st.City))
+			}
+		}
+	}
+
+	// Pull POP rows filtered by poster_id + optional scope.
+	type popItem struct {
+		PosterName  string    `json:"poster_name"`
+		PosterID    string    `json:"poster_id"`
+		HostName    string    `json:"host_name"`
+		KioskName   string    `json:"kiosk_name"`
+		PosterType  string    `json:"poster_type"`
+		PopDatetime time.Time `json:"pop_datetime"`
+		City        string    `json:"city"`
+		Region      string    `json:"region"`
+		PlayCount   int64     `json:"play_count"`
+	}
+	type popListResponse struct {
+		Items    []popItem `json:"items"`
+		Total    int64     `json:"total"`
+		Page     int       `json:"page"`
+		PageSize int       `json:"page_size"`
+	}
+
+	page := 1
+	pageSize := 200
+	maxPages := 10
+	steps := make([]models.Step, 0, 2)
+	items := make([]popItem, 0, 64)
+	for {
+		path := fmt.Sprintf("/pop?poster_id=%s&page=%d&page_size=%d", urlEscape(posterID), page, pageSize)
+		if strings.TrimSpace(region) != "" {
+			path += "&region=" + urlEscape(region)
+		} else if strings.TrimSpace(city) != "" {
+			path += "&city=" + urlEscape(city)
+		}
+		status, body, err := c.Gateway.Get(path)
+		step := models.Step{Tool: "popList", Status: status}
+		if err != nil {
+			step.Error = err.Error()
+		} else {
+			step.Body = clipString(strings.TrimSpace(string(body)), 2000)
+		}
+		steps = append(steps, step)
+		if err != nil {
+			return models.ChatResponse{Answer: "Failed to fetch POP data: " + err.Error(), Steps: steps}, true, nil
+		}
+		if status < 200 || status >= 300 {
+			return models.ChatResponse{Answer: fmt.Sprintf("Failed to fetch POP data (status %d).", status), Steps: steps}, true, nil
+		}
+		var resp popListResponse
+		if json.Unmarshal(body, &resp) != nil {
+			return models.ChatResponse{Answer: "POP list response could not be parsed.", Steps: steps}, true, nil
+		}
+		if len(resp.Items) == 0 {
+			break
+		}
+		items = append(items, resp.Items...)
+		if resp.Total > 0 {
+			if int64(page*pageSize) >= resp.Total {
+				break
+			}
+		} else if len(resp.Items) < pageSize {
+			break
+		}
+		page++
+		if page > maxPages {
+			break
+		}
+	}
+
+	if len(items) == 0 {
+		answer := fmt.Sprintf("No POP rows found for poster %s.", posterID)
+		if onToken != nil {
+			onToken(answer)
+		}
+		return models.ChatResponse{Answer: answer, Steps: steps}, true, nil
+	}
+
+	totalPlays := int64(0)
+	for _, it := range items {
+		totalPlays += it.PlayCount
+	}
+
+	posterName := strings.TrimSpace(items[0].PosterName)
+	label := posterID
+	if posterName != "" {
+		label = posterName + " (" + posterID + ")"
+	}
+	scopeLabel := ""
+	if strings.TrimSpace(region) != "" {
+		scopeLabel = "region '" + strings.TrimSpace(region) + "'"
+	} else if strings.TrimSpace(city) != "" {
+		scopeLabel = "city '" + strings.TrimSpace(city) + "'"
+	}
+	if scopeLabel != "" {
+		label = label + " in " + scopeLabel
+	}
+
+	if !isKioskWise {
+		answer := fmt.Sprintf("POP for poster %s: %d plays.", label, totalPlays)
+		if onToken != nil {
+			onToken(answer)
+		}
+		return models.ChatResponse{Answer: answer, Steps: steps}, true, nil
+	}
+
+	type kv struct {
+		Key   string
+		Plays int64
+	}
+	byKiosk := map[string]int64{}
+	for _, it := range items {
+		k := strings.TrimSpace(it.KioskName)
+		if k == "" {
+			k = strings.TrimSpace(it.HostName)
+		}
+		if k == "" {
+			continue
+		}
+		byKiosk[k] += it.PlayCount
+	}
+	rows := make([]kv, 0, len(byKiosk))
+	for k, v := range byKiosk {
+		rows = append(rows, kv{Key: k, Plays: v})
+	}
+	sort.Slice(rows, func(i, j int) bool { return rows[i].Plays > rows[j].Plays })
+	if len(rows) > 10 {
+		rows = rows[:10]
+	}
+	lines := make([]string, 0, len(rows)+2)
+	lines = append(lines, fmt.Sprintf("POP for poster %s: %d plays", label, totalPlays))
+	lines = append(lines, "Kiosk-wise:")
+	for i, r := range rows {
+		lines = append(lines, fmt.Sprintf("%d. %s — %d plays", i+1, r.Key, r.Plays))
+	}
+	answer := strings.Join(lines, "\n")
+	if onToken != nil {
+		onToken(answer)
+	}
+	if conversationID != "" {
+		c.updateConversationPoster(conversationID, posterName, city, region)
+		c.updateConversationPosterID(conversationID, posterID)
+		c.clearPending(conversationID)
+	}
+	return models.ChatResponse{Answer: answer, Steps: steps}, true, nil
+}
+
+func parseMonthYearRangeRFC3339(msg string) (string, string) {
+	s := strings.ToLower(strings.TrimSpace(msg))
+	if s == "" {
+		return "", ""
+	}
+	months := map[string]time.Month{
+		"january":   time.January,
+		"jan":       time.January,
+		"february":  time.February,
+		"feb":       time.February,
+		"march":     time.March,
+		"mar":       time.March,
+		"april":     time.April,
+		"apr":       time.April,
+		"may":       time.May,
+		"june":      time.June,
+		"jun":       time.June,
+		"july":      time.July,
+		"jul":       time.July,
+		"august":    time.August,
+		"aug":       time.August,
+		"september": time.September,
+		"sep":       time.September,
+		"sept":      time.September,
+		"october":   time.October,
+		"oct":       time.October,
+		"november":  time.November,
+		"nov":       time.November,
+		"december":  time.December,
+		"dec":       time.December,
+	}
+	words := tokenizeWords(s)
+	month := time.Month(0)
+	year := 0
+	for i := 0; i < len(words); i++ {
+		w := strings.ToLower(strings.TrimSpace(words[i]))
+		if month == 0 {
+			if m, ok := months[w]; ok {
+				month = m
+				// Year might be next token.
+				if i+1 < len(words) {
+					if y, err := strconv.Atoi(words[i+1]); err == nil && y >= 2000 && y <= 2100 {
+						year = y
+					}
+				}
+				continue
+			}
+		}
+		if year == 0 {
+			if y, err := strconv.Atoi(w); err == nil && y >= 2000 && y <= 2100 {
+				year = y
+			}
+		}
+	}
+	if month == 0 || year == 0 {
+		return "", ""
+	}
+	from := time.Date(year, month, 1, 0, 0, 0, 0, time.UTC)
+	to := from.AddDate(0, 1, 0)
+	return from.Format(time.RFC3339), to.Format(time.RFC3339)
+}
+
+func (c *ChatService) handlePosterMonthData(ctx context.Context, req models.ChatRequest, onToken func(string)) (models.ChatResponse, bool, error) {
+	msgLower := strings.ToLower(req.Message)
+	if !(strings.Contains(msgLower, "month") || strings.Contains(msgLower, "data")) {
+		return models.ChatResponse{}, false, nil
+	}
+	fromRFC, toRFC := parseMonthYearRangeRFC3339(req.Message)
+	if fromRFC == "" || toRFC == "" {
+		return models.ChatResponse{}, false, nil
+	}
+	if c.Gateway == nil {
+		return models.ChatResponse{Answer: "Tool gateway is not configured."}, true, nil
+	}
+
+	conversationID := strings.TrimSpace(req.ConversationID)
+	if conversationID == "" {
+		return models.ChatResponse{Answer: "Please provide a conversation id so I can reuse the last poster context."}, true, nil
+	}
+	st := c.getConversationState(conversationID)
+	if st == nil {
+		return models.ChatResponse{Answer: "Please ask for a poster first (by name or id), then ask for month data."}, true, nil
+	}
+
+	posterID := strings.TrimSpace(st.PosterID)
+	posterName := strings.TrimSpace(st.PosterName)
+	if posterID == "" && posterName == "" {
+		return models.ChatResponse{Answer: "Please specify a poster (by name or id) before asking for month data."}, true, nil
+	}
+
+	city := c.detectCityCode(ctx, msgLower)
+	region := c.detectRegionCode(ctx, msgLower)
+	if city == "" && region == "" {
+		if st != nil {
+			if strings.TrimSpace(st.PosterRegion) != "" {
+				region = strings.ToLower(strings.TrimSpace(st.PosterRegion))
+			}
+			if strings.TrimSpace(st.PosterCity) != "" {
+				city = strings.ToLower(strings.TrimSpace(st.PosterCity))
+			}
+			if region == "" && strings.TrimSpace(st.Region) != "" {
+				region = strings.ToLower(strings.TrimSpace(st.Region))
+			}
+			if city == "" && strings.TrimSpace(st.City) != "" {
+				city = strings.ToLower(strings.TrimSpace(st.City))
+			}
+		}
+	}
+	if city == "" && region == "" {
+		return models.ChatResponse{Answer: "Please specify a city or region code (for example: moco or brt)."}, true, nil
+	}
+
+	isKioskWise := strings.Contains(msgLower, "kiosk wise") || strings.Contains(msgLower, "kiosk-wise") || strings.Contains(msgLower, "by kiosk")
+
+	type popItem struct {
+		PosterName string `json:"poster_name"`
+		PosterID   string `json:"poster_id"`
+		HostName   string `json:"host_name"`
+		KioskName  string `json:"kiosk_name"`
+		City       string `json:"city"`
+		Region     string `json:"region"`
+		PlayCount  int64  `json:"play_count"`
+	}
+	type popListResponse struct {
+		Items    []popItem `json:"items"`
+		Total    int64     `json:"total"`
+		Page     int       `json:"page"`
+		PageSize int       `json:"page_size"`
+	}
+
+	page := 1
+	pageSize := 200
+	maxPages := 10
+	steps := make([]models.Step, 0, 2)
+	items := make([]popItem, 0, 64)
+	for {
+		path := fmt.Sprintf("/pop?from=%s&to=%s&page=%d&page_size=%d", urlEscape(fromRFC), urlEscape(toRFC), page, pageSize)
+		if looksLikeUUID(posterID) {
+			path += "&poster_id=" + urlEscape(posterID)
+		} else {
+			path += "&poster_name=" + urlEscape(posterName)
+		}
+		if strings.TrimSpace(region) != "" {
+			path += "&region=" + urlEscape(region)
+		} else if strings.TrimSpace(city) != "" {
+			path += "&city=" + urlEscape(city)
+		}
+		status, body, err := c.Gateway.Get(path)
+		step := models.Step{Tool: "popList", Status: status}
+		if err != nil {
+			step.Error = err.Error()
+		} else {
+			step.Body = clipString(strings.TrimSpace(string(body)), 2000)
+		}
+		steps = append(steps, step)
+		if err != nil {
+			return models.ChatResponse{Answer: "Failed to fetch POP data: " + err.Error(), Steps: steps}, true, nil
+		}
+		if status < 200 || status >= 300 {
+			return models.ChatResponse{Answer: fmt.Sprintf("Failed to fetch POP data (status %d).", status), Steps: steps}, true, nil
+		}
+		var resp popListResponse
+		if json.Unmarshal(body, &resp) != nil {
+			return models.ChatResponse{Answer: "POP list response could not be parsed.", Steps: steps}, true, nil
+		}
+		if len(resp.Items) == 0 {
+			break
+		}
+		items = append(items, resp.Items...)
+		if resp.Total > 0 {
+			if int64(page*pageSize) >= resp.Total {
+				break
+			}
+		} else if len(resp.Items) < pageSize {
+			break
+		}
+		page++
+		if page > maxPages {
+			break
+		}
+	}
+
+	if len(items) == 0 {
+		return models.ChatResponse{Answer: "No POP rows found for that month.", Steps: steps}, true, nil
+	}
+	totalPlays := int64(0)
+	for _, it := range items {
+		totalPlays += it.PlayCount
+	}
+	actualPosterName := strings.TrimSpace(items[0].PosterName)
+	actualPosterID := strings.TrimSpace(items[0].PosterID)
+	label := strings.TrimSpace(posterName)
+	if label == "" {
+		label = strings.TrimSpace(actualPosterName)
+	}
+	if label == "" {
+		label = strings.TrimSpace(posterID)
+	}
+	if label == "" {
+		label = strings.TrimSpace(actualPosterID)
+	}
+	monthLabel := strings.TrimSpace(req.Message)
+	if idx := strings.Index(strings.ToLower(monthLabel), "month"); idx > 0 {
+		monthLabel = strings.TrimSpace(monthLabel[:idx])
+	}
+	if conversationID != "" {
+		// Keep poster memory consistent with what we actually queried/received.
+		if actualPosterName != "" {
+			c.updateConversationPoster(conversationID, actualPosterName, city, region)
+		} else {
+			c.updateConversationPoster(conversationID, posterName, city, region)
+		}
+		if looksLikeUUID(actualPosterID) {
+			c.updateConversationPosterID(conversationID, actualPosterID)
+		} else if looksLikeUUID(posterID) {
+			c.updateConversationPosterID(conversationID, posterID)
+		}
+		c.clearPending(conversationID)
+	}
+	if !isKioskWise {
+		answer := fmt.Sprintf("POP for poster '%s' for %s: %d plays.", label, monthLabel, totalPlays)
+		if onToken != nil {
+			onToken(answer)
+		}
+		return models.ChatResponse{Answer: answer, Steps: steps}, true, nil
+	}
+
+	// Kiosk-wise.
+	byKiosk := map[string]int64{}
+	for _, it := range items {
+		k := strings.TrimSpace(it.KioskName)
+		if k == "" {
+			k = strings.TrimSpace(it.HostName)
+		}
+		if k == "" {
+			continue
+		}
+		byKiosk[k] += it.PlayCount
+	}
+	type kv struct {
+		Key   string
+		Plays int64
+	}
+	rows := make([]kv, 0, len(byKiosk))
+	for k, v := range byKiosk {
+		rows = append(rows, kv{Key: k, Plays: v})
+	}
+	sort.Slice(rows, func(i, j int) bool { return rows[i].Plays > rows[j].Plays })
+	if len(rows) > 10 {
+		rows = rows[:10]
+	}
+	lines := make([]string, 0, len(rows)+2)
+	lines = append(lines, fmt.Sprintf("POP for poster '%s' for %s: %d plays", label, monthLabel, totalPlays))
+	lines = append(lines, "Kiosk-wise:")
+	for i, r := range rows {
+		lines = append(lines, fmt.Sprintf("%d. %s — %d plays", i+1, r.Key, r.Plays))
+	}
+	answer := strings.Join(lines, "\n")
+	if onToken != nil {
+		onToken(answer)
+	}
+	return models.ChatResponse{Answer: answer, Steps: steps}, true, nil
+}
+
+func (c *ChatService) handleLowUptimeDevices(ctx context.Context, req models.ChatRequest, onToken func(string)) (models.ChatResponse, bool, error) {
+	msgLower := strings.ToLower(req.Message)
+	if !strings.Contains(msgLower, "uptime") {
+		return models.ChatResponse{}, false, nil
+	}
+	if !(strings.Contains(msgLower, "low") || strings.Contains(msgLower, "lowest") || strings.Contains(msgLower, "down") || strings.Contains(msgLower, "unstable")) {
+		return models.ChatResponse{}, false, nil
+	}
+	if !(strings.Contains(msgLower, "device") || strings.Contains(msgLower, "devices") || strings.Contains(msgLower, "kiosk") || strings.Contains(msgLower, "kiosks")) {
+		return models.ChatResponse{}, false, nil
+	}
+	// If a specific host is requested, let the per-host telemetry handler answer.
+	if len(detectHostTokens(req.Message)) > 0 {
+		return models.ChatResponse{}, false, nil
+	}
+	if c.Gateway == nil {
+		return models.ChatResponse{Answer: "Tool gateway is not configured."}, true, nil
+	}
+
+	conversationID := strings.TrimSpace(req.ConversationID)
+	city := c.detectCityCode(ctx, msgLower)
+	region := c.detectRegionCode(ctx, msgLower)
+	if city == "" && region == "" && conversationID != "" {
+		if st := c.getConversationState(conversationID); st != nil {
+			if strings.TrimSpace(st.City) != "" {
+				city = strings.ToLower(strings.TrimSpace(st.City))
+			}
+			if strings.TrimSpace(st.Region) != "" {
+				region = strings.ToLower(strings.TrimSpace(st.Region))
+			}
+		}
+	}
+
+	filterCity := strings.ToLower(strings.TrimSpace(city))
+	filterRegion := strings.ToLower(strings.TrimSpace(region))
+
+	type row struct {
+		ServerID string
+		City     string
+		Region   string
+		Uptime   int64
+		Time     time.Time
+	}
+
+	rows := make([]row, 0, 128)
+	steps := make([]models.Step, 0, 3)
+	page := 1
+	pageSize := 200
+	maxPages := 5
+	for {
+		path := fmt.Sprintf("/metrics/latest?page=%d&page_size=%d&include_totals=false", page, pageSize)
+		status, body, err := c.Gateway.Get(path)
+		step := models.Step{Tool: "metricsLatest", Status: status}
+		if err != nil {
+			step.Error = err.Error()
+		} else {
+			step.Body = clipString(strings.TrimSpace(string(body)), 2000)
+		}
+		steps = append(steps, step)
+		if err != nil {
+			return models.ChatResponse{Answer: "Failed to fetch latest metrics: " + err.Error(), Steps: steps}, true, nil
+		}
+		if status < 200 || status >= 300 {
+			return models.ChatResponse{Answer: fmt.Sprintf("Failed to fetch latest metrics (status %d).", status), Steps: steps}, true, nil
+		}
+
+		var payload struct {
+			Data []struct {
+				Time     time.Time `json:"time"`
+				Uptime   int64     `json:"uptime"`
+				ServerID string    `json:"server_id"`
+				City     string    `json:"city"`
+				Region   string    `json:"region"`
+			} `json:"data"`
+			Pagination struct {
+				HasMore bool `json:"has_more"`
+			} `json:"pagination"`
+		}
+		if json.Unmarshal(body, &payload) != nil {
+			return models.ChatResponse{Answer: "Latest metrics response could not be parsed.", Steps: steps}, true, nil
+		}
+
+		for _, it := range payload.Data {
+			sid := strings.ToLower(strings.TrimSpace(it.ServerID))
+			if sid == "" {
+				continue
+			}
+			itCity := strings.ToLower(strings.TrimSpace(it.City))
+			itRegion := strings.ToLower(strings.TrimSpace(it.Region))
+			if filterCity != "" && itCity != filterCity {
+				continue
+			}
+			if filterRegion != "" && itRegion != filterRegion {
+				continue
+			}
+			rows = append(rows, row{ServerID: sid, City: itCity, Region: itRegion, Uptime: it.Uptime, Time: it.Time})
+		}
+
+		if !payload.Pagination.HasMore {
+			break
+		}
+		page++
+		if page > maxPages {
+			break
+		}
+	}
+
+	if len(rows) == 0 {
+		scope := "the current scope"
+		if filterRegion != "" || filterCity != "" {
+			parts := make([]string, 0, 2)
+			if filterRegion != "" {
+				parts = append(parts, "region '"+filterRegion+"'")
+			}
+			if filterCity != "" {
+				parts = append(parts, "city '"+filterCity+"'")
+			}
+			scope = strings.Join(parts, ", ")
+		}
+		answer := fmt.Sprintf("No devices with uptime metrics were found for %s.", scope)
+		if onToken != nil {
+			onToken(answer)
+		}
+		return models.ChatResponse{Answer: answer, Steps: steps}, true, nil
+	}
+
+	sort.Slice(rows, func(i, j int) bool {
+		ui := rows[i].Uptime
+		uj := rows[j].Uptime
+		if ui == 0 && uj > 0 {
+			return true
+		}
+		if uj == 0 && ui > 0 {
+			return false
+		}
+		if ui == uj {
+			return rows[i].ServerID < rows[j].ServerID
+		}
+		return ui < uj
+	})
+
+	limit := 10
+	if n := extractTopN(msgLower); n > 0 {
+		limit = n
+	}
+	if limit > 50 {
+		limit = 50
+	}
+	if limit > len(rows) {
+		limit = len(rows)
+	}
+
+	lines := make([]string, 0, limit)
+	for i := 0; i < limit; i++ {
+		r := rows[i]
+		label := r.ServerID
+		if r.City != "" || r.Region != "" {
+			label = fmt.Sprintf("%s (%s/%s)", r.ServerID, r.City, r.Region)
+		}
+		d := time.Duration(r.Uptime) * time.Second
+		if r.Uptime == 0 {
+			lines = append(lines, fmt.Sprintf("%d. %s — uptime unknown/0", i+1, label))
+		} else {
+			lines = append(lines, fmt.Sprintf("%d. %s — %s", i+1, label, d.String()))
+		}
+	}
+
+	answer := "Devices with lowest uptime:\n" + strings.Join(lines, "\n")
+	if onToken != nil {
+		onToken(answer)
+	}
+	return models.ChatResponse{Answer: answer, Steps: steps}, true, nil
+}
+
+func (c *ChatService) handlePopYesterdayByHost(ctx context.Context, req models.ChatRequest, onToken func(string)) (models.ChatResponse, bool, error) {
+	msgLower := strings.ToLower(req.Message)
+	if !strings.Contains(msgLower, "pop") {
+		return models.ChatResponse{}, false, nil
+	}
+	if !(strings.Contains(msgLower, "yesterday") || strings.Contains(msgLower, "yesterday's") || strings.Contains(msgLower, "yesterdays")) {
+		return models.ChatResponse{}, false, nil
+	}
+	showMinutes := strings.Contains(msgLower, "minute") || strings.Contains(msgLower, "minutes")
+
+	if c.Gateway == nil {
+		return models.ChatResponse{Answer: "Tool gateway is not configured."}, true, nil
+	}
+
+	conversationID := strings.TrimSpace(req.ConversationID)
+	host := ""
+	if tokens := detectHostTokens(req.Message); len(tokens) > 0 {
+		candidate := strings.ToLower(strings.TrimSpace(tokens[0]))
+		parts := strings.Split(strings.ReplaceAll(candidate, "_", "-"), "-")
+		if len(parts) >= 3 {
+			host = candidate
+		}
+	}
+
+	// If user didn't provide a host-like token, try last host or resolve display name.
+	var resolveStep *models.Step
+	if host == "" {
+		if conversationID != "" {
+			if st := c.getConversationState(conversationID); st != nil {
+				if strings.TrimSpace(st.Host) != "" {
+					host = strings.ToLower(strings.TrimSpace(st.Host))
+				}
+			}
+		}
+	}
+	if host == "" {
+		// Try to extract the display name portion (avoid passing the whole sentence into the resolver).
+		lookup := extractAfterKeyword(msgLower, "for")
+		if lookup == "" {
+			lookup = extractAfterKeyword(msgLower, "of")
+		}
+		if lookup == "" {
+			lookup = extractAfterKeyword(msgLower, "info")
+		}
+		if lookup == "" {
+			lookup = extractAfterKeyword(msgLower, "details")
+		}
+		if lookup == "" {
+			lookup = extractAfterKeyword(msgLower, "about")
+		}
+		lookup = strings.TrimSpace(lookup)
+		if lookup == "" {
+			lookup = req.Message
+		}
+		if resolved, step := c.resolveHostFromDeviceName(ctx, conversationID, lookup); strings.TrimSpace(resolved) != "" {
+			host = strings.ToLower(strings.TrimSpace(resolved))
+			resolveStep = step
+		} else if lookup != req.Message {
+			// Fallback: some phrasings may not extract cleanly; try resolving using the full message.
+			if resolved2, step2 := c.resolveHostFromDeviceName(ctx, conversationID, req.Message); strings.TrimSpace(resolved2) != "" {
+				host = strings.ToLower(strings.TrimSpace(resolved2))
+				resolveStep = step2
+			}
+		}
+	}
+	if host == "" {
+		return models.ChatResponse{Answer: "Please specify the device host/server id (for example: moco-brt-briggs-001) or a kiosk display name."}, true, nil
+	}
+	if conversationID != "" {
+		c.updateConversationHost(conversationID, host)
+		c.clearPending(conversationID)
+	}
+
+	// Pull yesterday's POP rows for this host.
+	type popItem struct {
+		PosterName  string    `json:"poster_name"`
+		PosterID    string    `json:"poster_id"`
+		HostName    string    `json:"host_name"`
+		KioskName   string    `json:"kiosk_name"`
+		PosterType  string    `json:"poster_type"`
+		PopDatetime time.Time `json:"pop_datetime"`
+		KioskLat    float64   `json:"kiosk_lat"`
+		KioskLong   float64   `json:"kiosk_long"`
+		City        string    `json:"city"`
+		Region      string    `json:"region"`
+		PlayCount   int64     `json:"play_count"`
+		Value       int64     `json:"value"`
+		Type        string    `json:"type"`
+		Url         string    `json:"url"`
+	}
+	type popListResponse struct {
+		Items    []popItem `json:"items"`
+		Total    int64     `json:"total"`
+		Page     int       `json:"page"`
+		PageSize int       `json:"page_size"`
+	}
+
+	page := 1
+	pageSize := 200
+	maxPages := 10
+	steps := make([]models.Step, 0, 2)
+	items := make([]popItem, 0, 64)
+	// Prefer explicit RFC3339 date range for determinism.
+	// Use UTC day boundaries: [yesterday 00:00, today 00:00).
+	todayStartUTC := time.Now().UTC().Truncate(24 * time.Hour)
+	yesterdayStartUTC := todayStartUTC.Add(-24 * time.Hour)
+	fromRFC := yesterdayStartUTC.Format(time.RFC3339)
+	toRFC := todayStartUTC.Format(time.RFC3339)
+	useDateRange := true
+	// Tool gateway preset values have differed across deployments; try a few common aliases.
+	presets := []string{"yesterday", "previous_day", "prev_day", "last_day"}
+	selectedPreset := ""
+	forLoop:
+	for {
+		if useDateRange {
+			path := fmt.Sprintf("/pop?host_name=%s&from=%s&to=%s&page=%d&page_size=%d", urlEscape(host), urlEscape(fromRFC), urlEscape(toRFC), page, pageSize)
+			status, body, err := c.Gateway.Get(path)
+			step := models.Step{Tool: "popList", Status: status}
+			if err != nil {
+				step.Error = err.Error()
+			} else {
+				step.Body = clipString(strings.TrimSpace(string(body)), 2000)
+			}
+			steps = append(steps, step)
+			if err != nil {
+				return models.ChatResponse{Answer: "Failed to fetch POP data: " + err.Error(), Steps: steps}, true, nil
+			}
+			if status >= 200 && status < 300 {
+				var resp popListResponse
+				if json.Unmarshal(body, &resp) != nil {
+					return models.ChatResponse{Answer: "POP list response could not be parsed.", Steps: steps}, true, nil
+				}
+				if len(resp.Items) == 0 {
+					break
+				}
+				items = append(items, resp.Items...)
+				if resp.Total > 0 {
+					if int64(page*pageSize) >= resp.Total {
+						break
+					}
+				} else if len(resp.Items) < pageSize {
+					break
+				}
+				page++
+				if page > maxPages {
+					break
+				}
+				continue
+			}
+			// If the gateway doesn't support from/to filtering, fall back to preset probing.
+			if status == 400 {
+				useDateRange = false
+				// Reset pagination for preset mode.
+				page = 1
+				continue
+			}
+			return models.ChatResponse{Answer: fmt.Sprintf("Failed to fetch POP data (status %d).", status), Steps: steps}, true, nil
+		}
+
+		if selectedPreset == "" {
+			// Probe which preset works on the first page.
+			for _, p := range presets {
+				probePath := fmt.Sprintf("/pop?host_name=%s&preset=%s&page=%d&page_size=%d", urlEscape(host), urlEscape(p), page, pageSize)
+				status, body, err := c.Gateway.Get(probePath)
+				step := models.Step{Tool: "popList", Status: status}
+				if err != nil {
+					step.Error = err.Error()
+				} else {
+					step.Body = clipString(strings.TrimSpace(string(body)), 2000)
+				}
+				steps = append(steps, step)
+				if err != nil {
+					return models.ChatResponse{Answer: "Failed to fetch POP data: " + err.Error(), Steps: steps}, true, nil
+				}
+				if status >= 200 && status < 300 {
+					selectedPreset = p
+					var resp popListResponse
+					if json.Unmarshal(body, &resp) != nil {
+						return models.ChatResponse{Answer: "POP list response could not be parsed.", Steps: steps}, true, nil
+					}
+					if len(resp.Items) == 0 {
+						return models.ChatResponse{Answer: fmt.Sprintf("No POP data was found for '%s' yesterday.", host), Steps: steps}, true, nil
+					}
+					items = append(items, resp.Items...)
+					if resp.Total > 0 {
+						if int64(page*pageSize) >= resp.Total {
+							break
+						}
+					} else if len(resp.Items) < pageSize {
+						break
+					}
+					page++
+					continue forLoop
+				}
+				// If preset is invalid, gateway typically returns 400 with {"error":"invalid preset"}.
+				if status == 400 && strings.Contains(strings.ToLower(strings.TrimSpace(string(body))), "invalid preset") {
+					continue
+				}
+				// Any other non-2xx is a real failure.
+				return models.ChatResponse{Answer: fmt.Sprintf("Failed to fetch POP data (status %d).", status), Steps: steps}, true, nil
+			}
+			return models.ChatResponse{Answer: "This POP endpoint does not appear to support a 'yesterday' preset on this gateway.", Steps: steps}, true, nil
+		}
+
+		path := fmt.Sprintf("/pop?host_name=%s&preset=%s&page=%d&page_size=%d", urlEscape(host), urlEscape(selectedPreset), page, pageSize)
+		status, body, err := c.Gateway.Get(path)
+		step := models.Step{Tool: "popList", Status: status}
+		if err != nil {
+			step.Error = err.Error()
+		} else {
+			step.Body = clipString(strings.TrimSpace(string(body)), 2000)
+		}
+		steps = append(steps, step)
+		if err != nil {
+			return models.ChatResponse{Answer: "Failed to fetch POP data: " + err.Error(), Steps: steps}, true, nil
+		}
+		if status < 200 || status >= 300 {
+			return models.ChatResponse{Answer: fmt.Sprintf("Failed to fetch POP data (status %d).", status), Steps: steps}, true, nil
+		}
+		var resp popListResponse
+		if json.Unmarshal(body, &resp) != nil {
+			return models.ChatResponse{Answer: "POP list response could not be parsed.", Steps: steps}, true, nil
+		}
+		if len(resp.Items) == 0 {
+			break
+		}
+		items = append(items, resp.Items...)
+		// Stop once we are past the last page when total is available.
+		if resp.Total > 0 {
+			if int64(page*pageSize) >= resp.Total {
+				break
+			}
+		} else if len(resp.Items) < pageSize {
+			break
+		}
+		page++
+		if page > maxPages {
+			break
+		}
+	}
+	if resolveStep != nil {
+		steps = append([]models.Step{*resolveStep}, steps...)
+	}
+
+	if len(items) == 0 {
+		return models.ChatResponse{Answer: fmt.Sprintf("No POP data was found for '%s' yesterday.", host), Steps: steps}, true, nil
+	}
+
+	// Aggregate by poster.
+	type agg struct {
+		PosterID   string
+		PosterName string
+		PosterType string
+		Url        string
+		PlayCount  int64
+		Value      int64
+		LastSeen   time.Time
+		KioskName  string
+		KioskLat   float64
+		KioskLong  float64
+		City       string
+		Region     string
+		HostName   string
+	}
+	byPoster := map[string]*agg{}
+	for _, it := range items {
+		key := strings.TrimSpace(it.PosterID)
+		if key == "" {
+			key = strings.TrimSpace(it.PosterName)
+		}
+		if key == "" {
+			continue
+		}
+		a := byPoster[key]
+		if a == nil {
+			a = &agg{
+				PosterID:   strings.TrimSpace(it.PosterID),
+				PosterName: strings.TrimSpace(it.PosterName),
+				PosterType: strings.TrimSpace(it.PosterType),
+				Url:        strings.TrimSpace(it.Url),
+				KioskName:  strings.TrimSpace(it.KioskName),
+				KioskLat:   it.KioskLat,
+				KioskLong:  it.KioskLong,
+				City:       strings.ToLower(strings.TrimSpace(it.City)),
+				Region:     strings.ToLower(strings.TrimSpace(it.Region)),
+				HostName:   strings.ToLower(strings.TrimSpace(it.HostName)),
+			}
+			byPoster[key] = a
+		}
+		a.PlayCount += it.PlayCount
+		a.Value += it.Value
+		if it.PopDatetime.After(a.LastSeen) {
+			a.LastSeen = it.PopDatetime
+			if strings.TrimSpace(it.Url) != "" {
+				a.Url = strings.TrimSpace(it.Url)
+			}
+			if strings.TrimSpace(it.PosterType) != "" {
+				a.PosterType = strings.TrimSpace(it.PosterType)
+			}
+		}
+		if strings.TrimSpace(a.PosterName) == "" && strings.TrimSpace(it.PosterName) != "" {
+			a.PosterName = strings.TrimSpace(it.PosterName)
+		}
+	}
+
+	rows := make([]*agg, 0, len(byPoster))
+	for _, a := range byPoster {
+		rows = append(rows, a)
+	}
+	sort.Slice(rows, func(i, j int) bool { return rows[i].PlayCount > rows[j].PlayCount })
+	if len(rows) > 10 {
+		rows = rows[:10]
+	}
+
+	first := rows[0]
+	lines := make([]string, 0, len(rows)+2)
+	if showMinutes {
+		lines = append(lines, fmt.Sprintf("Yesterday's POP for '%s' (%s) in minutes:", host, strings.TrimSpace(first.KioskName)))
+		lines = append(lines, "(Minutes computed from POP 'value' duration; if missing, estimated assuming 10 seconds per play.)")
+	} else {
+		lines = append(lines, fmt.Sprintf("Yesterday's POP for '%s' (%s):", host, strings.TrimSpace(first.KioskName)))
+	}
+	for i, r := range rows {
+		name := r.PosterName
+		if strings.TrimSpace(name) == "" {
+			name = r.PosterID
+		}
+		if strings.TrimSpace(name) == "" {
+			continue
+		}
+		extra := ""
+		if strings.TrimSpace(r.PosterType) != "" {
+			extra = " (" + strings.TrimSpace(r.PosterType) + ")"
+		}
+		if showMinutes {
+			seconds := r.Value
+			if seconds <= 0 {
+				seconds = r.PlayCount * 10
+			}
+			mins := float64(seconds) / 60.0
+			lines = append(lines, fmt.Sprintf("%d. %s — %.1f minutes%s", i+1, name, mins, extra))
+		} else {
+			lines = append(lines, fmt.Sprintf("%d. %s — %d plays%s", i+1, name, r.PlayCount, extra))
+		}
+	}
+	lines = append(lines, fmt.Sprintf("Location: %.6f, %.6f | Last update: %s", first.KioskLat, first.KioskLong, first.LastSeen.UTC().Format(time.RFC3339)))
+	answer := strings.Join(lines, "\n")
+	if onToken != nil {
+		onToken(answer)
+	}
+	return models.ChatResponse{Answer: answer, Steps: steps}, true, nil
+}
+
 func debugLogf(format string, args ...any) {
 	if !debugEnabled() {
 		return
@@ -297,12 +2029,19 @@ func isListCampaignsIntent(msgLower string) bool {
 
 func (c *ChatService) handlePopTodayByHost(ctx context.Context, req models.ChatRequest, onToken func(string)) (models.ChatResponse, bool, error) {
 	msgLower := strings.ToLower(req.Message)
-	if !strings.Contains(msgLower, "pop") {
+	// Intent:
+	// - "pop today", "current day pop"
+	// - "stats for <device>" (treat as today's stats by default)
+	isPop := strings.Contains(msgLower, "pop") || strings.Contains(msgLower, "stats")
+	isToday := strings.Contains(msgLower, "today") || strings.Contains(msgLower, "today's") || strings.Contains(msgLower, "todays") || strings.Contains(msgLower, "current_day")
+	isStatsForDevice := strings.Contains(msgLower, "stats") && (strings.Contains(msgLower, "device") || strings.Contains(msgLower, "kiosk") || strings.Contains(msgLower, "server"))
+	// Follow-up like "show pop" after a device info query: reuse last resolved host.
+	msgTrim := strings.ToLower(strings.TrimSpace(msgLower))
+	isShowPopFollowup := msgTrim == "pop" || msgTrim == "show pop" || msgTrim == "show me pop" || msgTrim == "show the pop" || msgTrim == "get pop" || msgTrim == "get me pop"
+	if !isPop || (!isToday && !isStatsForDevice && !isShowPopFollowup) {
 		return models.ChatResponse{}, false, nil
 	}
-	if !(strings.Contains(msgLower, "today") || strings.Contains(msgLower, "today's") || strings.Contains(msgLower, "todays") || strings.Contains(msgLower, "current_day")) {
-		return models.ChatResponse{}, false, nil
-	}
+	showMinutes := strings.Contains(msgLower, "minute") || strings.Contains(msgLower, "minutes")
 
 	if c.Gateway == nil {
 		return models.ChatResponse{Answer: "Tool gateway is not configured."}, true, nil
@@ -330,9 +2069,33 @@ func (c *ChatService) handlePopTodayByHost(ctx context.Context, req models.ChatR
 		}
 	}
 	if host == "" {
-		if resolved, step := c.resolveHostFromDeviceName(ctx, conversationID, req.Message); strings.TrimSpace(resolved) != "" {
+		// Try to extract the display name portion (avoid passing the whole sentence into the resolver).
+		lookup := extractAfterKeyword(msgLower, "stats for")
+		if lookup == "" {
+			lookup = extractAfterKeyword(msgLower, "for")
+		}
+		if lookup == "" {
+			lookup = extractAfterKeyword(msgLower, "info")
+		}
+		if lookup == "" {
+			lookup = extractAfterKeyword(msgLower, "details")
+		}
+		if lookup == "" {
+			lookup = extractAfterKeyword(msgLower, "about")
+		}
+		lookup = strings.TrimSpace(lookup)
+		if lookup == "" {
+			lookup = req.Message
+		}
+		if resolved, step := c.resolveHostFromDeviceName(ctx, conversationID, lookup); strings.TrimSpace(resolved) != "" {
 			host = strings.ToLower(strings.TrimSpace(resolved))
 			resolveStep = step
+		} else if lookup != req.Message {
+			// Fallback: some phrasings may not extract cleanly; try resolving using the full message.
+			if resolved2, step2 := c.resolveHostFromDeviceName(ctx, conversationID, req.Message); strings.TrimSpace(resolved2) != "" {
+				host = strings.ToLower(strings.TrimSpace(resolved2))
+				resolveStep = step2
+			}
 		}
 	}
 	if host == "" {
@@ -424,6 +2187,7 @@ func (c *ChatService) handlePopTodayByHost(ctx context.Context, req models.ChatR
 		PosterType  string
 		Url         string
 		PlayCount   int64
+		Value       int64
 		LastSeen    time.Time
 		KioskName   string
 		KioskLat    float64
@@ -458,6 +2222,7 @@ func (c *ChatService) handlePopTodayByHost(ctx context.Context, req models.ChatR
 			byPoster[key] = a
 		}
 		a.PlayCount += it.PlayCount
+		a.Value += it.Value
 		if it.PopDatetime.After(a.LastSeen) {
 			a.LastSeen = it.PopDatetime
 			if strings.TrimSpace(it.Url) != "" {
@@ -483,7 +2248,12 @@ func (c *ChatService) handlePopTodayByHost(ctx context.Context, req models.ChatR
 
 	first := rows[0]
 	lines := make([]string, 0, len(rows)+2)
-	lines = append(lines, fmt.Sprintf("Today's POP for '%s' (%s):", host, strings.TrimSpace(first.KioskName)))
+	if showMinutes {
+		lines = append(lines, fmt.Sprintf("Today's POP for '%s' (%s) in minutes:", host, strings.TrimSpace(first.KioskName)))
+		lines = append(lines, "(Minutes computed from POP 'value' duration; if missing, estimated assuming 10 seconds per play.)")
+	} else {
+		lines = append(lines, fmt.Sprintf("Today's POP for '%s' (%s):", host, strings.TrimSpace(first.KioskName)))
+	}
 	for i, r := range rows {
 		name := r.PosterName
 		if strings.TrimSpace(name) == "" {
@@ -496,9 +2266,724 @@ func (c *ChatService) handlePopTodayByHost(ctx context.Context, req models.ChatR
 		if strings.TrimSpace(r.PosterType) != "" {
 			extra = " (" + strings.TrimSpace(r.PosterType) + ")"
 		}
-		lines = append(lines, fmt.Sprintf("%d. %s — %d plays%s", i+1, name, r.PlayCount, extra))
+		if showMinutes {
+			seconds := r.Value
+			if seconds <= 0 {
+				seconds = r.PlayCount * 10
+			}
+			mins := float64(seconds) / 60.0
+			lines = append(lines, fmt.Sprintf("%d. %s — %.1f minutes%s", i+1, name, mins, extra))
+		} else {
+			lines = append(lines, fmt.Sprintf("%d. %s — %d plays%s", i+1, name, r.PlayCount, extra))
+		}
 	}
 	lines = append(lines, fmt.Sprintf("Location: %.6f, %.6f | Last update: %s", first.KioskLat, first.KioskLong, first.LastSeen.UTC().Format(time.RFC3339)))
+	answer := strings.Join(lines, "\n")
+	if onToken != nil {
+		onToken(answer)
+	}
+	return models.ChatResponse{Answer: answer, Steps: steps}, true, nil
+}
+
+func (c *ChatService) handleVenueSearchList(ctx context.Context, req models.ChatRequest, onToken func(string)) (models.ChatResponse, bool, error) {
+	msgLower := strings.ToLower(req.Message)
+	if !(strings.Contains(msgLower, "venue") || strings.Contains(msgLower, "venues")) {
+		return models.ChatResponse{}, false, nil
+	}
+	if c.Gateway == nil {
+		return models.ChatResponse{Answer: "Tool gateway is not configured."}, true, nil
+	}
+	isSearch := strings.Contains(msgLower, "search") || strings.Contains(msgLower, "find")
+	isList := strings.Contains(msgLower, "list") || strings.Contains(msgLower, "show") || strings.Contains(msgLower, "all")
+	if !(isSearch || isList) {
+		return models.ChatResponse{}, false, nil
+	}
+	query := ""
+	if isSearch {
+		query = extractAfterKeyword(msgLower, "venues")
+		if query == "" {
+			query = extractAfterKeyword(msgLower, "venue")
+		}
+		query = strings.TrimSpace(query)
+		if query == "" {
+			return models.ChatResponse{Answer: "Please provide a venue search query (for example: search venues Union Station)."}, true, nil
+		}
+	}
+
+	status, body, err := c.Gateway.Get("/ads/venues?page=1&page_size=50")
+	step := models.Step{Tool: "adsVenues", Status: status}
+	if err != nil {
+		step.Error = err.Error()
+	} else {
+		step.Body = clipString(strings.TrimSpace(string(body)), 2000)
+	}
+	steps := []models.Step{step}
+	if err != nil {
+		return models.ChatResponse{Answer: "Failed to fetch venues: " + err.Error(), Steps: steps}, true, nil
+	}
+	if status < 200 || status >= 300 {
+		return models.ChatResponse{Answer: fmt.Sprintf("Failed to fetch venues (status %d).", status), Steps: steps}, true, nil
+	}
+	var parsed map[string]any
+	if json.Unmarshal(body, &parsed) != nil {
+		return models.ChatResponse{Answer: "Venues response could not be parsed.", Steps: steps}, true, nil
+	}
+	rowsAny, _ := parsed["data"].([]any)
+	if len(rowsAny) == 0 {
+		return models.ChatResponse{Answer: "No venues found.", Steps: steps}, true, nil
+	}
+
+	qLower := strings.ToLower(query)
+	rows := make([]map[string]any, 0, len(rowsAny))
+	for _, it := range rowsAny {
+		m, ok := it.(map[string]any)
+		if !ok {
+			continue
+		}
+		name, _ := m["name"].(string)
+		idNum := 0
+		switch v := m["id"].(type) {
+		case float64:
+			idNum = int(v)
+		case int:
+			idNum = v
+		}
+		name = strings.TrimSpace(name)
+		if name == "" || idNum <= 0 {
+			continue
+		}
+		if isSearch {
+			if !strings.Contains(strings.ToLower(name), qLower) {
+				continue
+			}
+		}
+		rows = append(rows, m)
+	}
+	if len(rows) == 0 {
+		return models.ChatResponse{Answer: fmt.Sprintf("No venues found for query '%s'.", query), Steps: steps}, true, nil
+	}
+
+	limit := 10
+	lines := make([]string, 0, limit+1)
+	if isSearch {
+		lines = append(lines, fmt.Sprintf("Venue search results for '%s':", query))
+	} else {
+		lines = append(lines, "Venues:")
+	}
+	for _, m := range rows {
+		if len(lines)-1 >= limit {
+			break
+		}
+		name, _ := m["name"].(string)
+		idNum := 0
+		switch v := m["id"].(type) {
+		case float64:
+			idNum = int(v)
+		case int:
+			idNum = v
+		}
+		name = strings.TrimSpace(name)
+		if name == "" || idNum <= 0 {
+			continue
+		}
+		lines = append(lines, fmt.Sprintf("- %s (%d)", name, idNum))
+	}
+	answer := strings.Join(lines, "\n")
+	if onToken != nil {
+		onToken(answer)
+	}
+	return models.ChatResponse{Answer: answer, Steps: steps}, true, nil
+}
+
+func (c *ChatService) handleVenueDevices(ctx context.Context, req models.ChatRequest, onToken func(string)) (models.ChatResponse, bool, error) {
+	msgLower := strings.ToLower(req.Message)
+	// "venues for <device>" should be handled by handleDeviceVenues.
+	if strings.Contains(msgLower, "venues for") {
+		return models.ChatResponse{}, false, nil
+	}
+	if !(strings.Contains(msgLower, "venue") || strings.Contains(msgLower, "venues")) {
+		return models.ChatResponse{}, false, nil
+	}
+	if !(strings.Contains(msgLower, "device") || strings.Contains(msgLower, "devices")) {
+		return models.ChatResponse{}, false, nil
+	}
+	if !(strings.Contains(msgLower, "in") || strings.Contains(msgLower, "for") || strings.Contains(msgLower, "from") || strings.Contains(msgLower, "show")) {
+		return models.ChatResponse{}, false, nil
+	}
+	if c.Gateway == nil {
+		return models.ChatResponse{Answer: "Tool gateway is not configured."}, true, nil
+	}
+	conversationID := strings.TrimSpace(req.ConversationID)
+	venueID := extractFirstInt(req.Message)
+	var resolveStep *models.Step
+	if venueID <= 0 {
+		// Try resolving venue name.
+		lookup := extractAfterKeyword(msgLower, "venue")
+		if lookup == "" {
+			lookup = extractAfterKeyword(msgLower, "venues")
+		}
+		if lookup == "" && (strings.Contains(msgLower, "from") || strings.Contains(msgLower, "in")) {
+			if idx := strings.LastIndex(msgLower, "from"); idx >= 0 {
+				lookup = strings.TrimSpace(msgLower[idx+4:])
+			} else if idx := strings.LastIndex(msgLower, "in"); idx >= 0 {
+				lookup = strings.TrimSpace(msgLower[idx+2:])
+			}
+		}
+		if lookup != "" {
+			if id, stp := c.resolveVenueIDFromName(ctx, conversationID, lookup); id > 0 {
+				venueID = id
+				resolveStep = stp
+			}
+		}
+	}
+	if venueID <= 0 && conversationID != "" {
+		if st := c.getConversationState(conversationID); st != nil {
+			venueID = st.VenueID
+		}
+	}
+	if venueID <= 0 {
+		return models.ChatResponse{Answer: "Please provide a venue id (number) or name. Example: show devices in venue Union Station."}, true, nil
+	}
+	if conversationID != "" {
+		c.updateConversationVenueID(conversationID, venueID)
+		c.clearPending(conversationID)
+	}
+
+	path := fmt.Sprintf("/ads/venues/%d/devices?page=1&page_size=20", venueID)
+	status, body, err := c.Gateway.Get(path)
+	step := models.Step{Tool: "adsVenueDevices", Status: status}
+	if err != nil {
+		step.Error = err.Error()
+	} else {
+		step.Body = clipString(strings.TrimSpace(string(body)), 2000)
+	}
+	steps := []models.Step{step}
+	if resolveStep != nil {
+		steps = append([]models.Step{*resolveStep}, steps...)
+	}
+	if err != nil {
+		return models.ChatResponse{Answer: "Failed to fetch venue devices: " + err.Error(), Steps: steps}, true, nil
+	}
+	if status < 200 || status >= 300 {
+		return models.ChatResponse{Answer: fmt.Sprintf("Failed to fetch venue devices (status %d).", status), Steps: steps}, true, nil
+	}
+	var parsed map[string]any
+	if json.Unmarshal(body, &parsed) != nil {
+		return models.ChatResponse{Answer: "Venue devices response could not be parsed.", Steps: steps}, true, nil
+	}
+	rowsAny, _ := parsed["data"].([]any)
+	if len(rowsAny) == 0 {
+		return models.ChatResponse{Answer: fmt.Sprintf("No devices found for venue %d.", venueID), Steps: steps}, true, nil
+	}
+	lines := []string{fmt.Sprintf("Devices in venue %d:", venueID)}
+	for _, it := range rowsAny {
+		if len(lines)-1 >= 10 {
+			break
+		}
+		m, ok := it.(map[string]any)
+		if !ok {
+			continue
+		}
+		nm, _ := m["name"].(string)
+		hn, _ := m["host_name"].(string)
+		nm = strings.TrimSpace(nm)
+		hn = strings.TrimSpace(hn)
+		if nm == "" {
+			nm = hn
+		}
+		if nm == "" {
+			continue
+		}
+		if hn != "" {
+			lines = append(lines, fmt.Sprintf("- %s (%s)", nm, hn))
+		} else {
+			lines = append(lines, "- "+nm)
+		}
+	}
+	answer := strings.Join(lines, "\n")
+	if onToken != nil {
+		onToken(answer)
+	}
+	return models.ChatResponse{Answer: answer, Steps: steps}, true, nil
+}
+
+func (c *ChatService) handleDeviceVenues(ctx context.Context, req models.ChatRequest, onToken func(string)) (models.ChatResponse, bool, error) {
+	msgLower := strings.ToLower(req.Message)
+	if !(strings.Contains(msgLower, "venue") || strings.Contains(msgLower, "venues")) {
+		return models.ChatResponse{}, false, nil
+	}
+	// Allow host-only phrasing like "show venues for moco-brt-...".
+	if !(strings.Contains(msgLower, "device") || strings.Contains(msgLower, "kiosk") || strings.Contains(msgLower, "server") || len(detectHostTokens(req.Message)) > 0) {
+		return models.ChatResponse{}, false, nil
+	}
+	if !(strings.Contains(msgLower, "for") || strings.Contains(msgLower, "of") || strings.Contains(msgLower, "show") || strings.Contains(msgLower, "list")) {
+		return models.ChatResponse{}, false, nil
+	}
+	if c.Gateway == nil {
+		return models.ChatResponse{Answer: "Tool gateway is not configured."}, true, nil
+	}
+	conversationID := strings.TrimSpace(req.ConversationID)
+	deviceID := extractExplicitDeviceID(msgLower)
+	resolvedHost := ""
+	var resolveStep *models.Step
+	if deviceID <= 0 {
+		// Try host token or last host, then resolve display name.
+		if tokens := detectHostTokens(req.Message); len(tokens) > 0 {
+			candidate := strings.ToLower(strings.TrimSpace(tokens[0]))
+			parts := strings.Split(strings.ReplaceAll(candidate, "_", "-"), "-")
+			if len(parts) >= 3 {
+				resolvedHost = candidate
+			}
+		}
+		if resolvedHost == "" && conversationID != "" {
+			if st := c.getConversationState(conversationID); st != nil {
+				if strings.TrimSpace(st.Host) != "" {
+					resolvedHost = strings.ToLower(strings.TrimSpace(st.Host))
+				}
+			}
+		}
+		if resolvedHost == "" {
+			lookup := extractAfterKeyword(msgLower, "device")
+			if lookup == "" {
+				lookup = extractAfterKeyword(msgLower, "kiosk")
+			}
+			lookup = strings.TrimSpace(lookup)
+			if lookup == "" {
+				lookup = req.Message
+			}
+			if h, stp := c.resolveHostFromDeviceName(ctx, conversationID, lookup); strings.TrimSpace(h) != "" {
+				resolvedHost = strings.ToLower(strings.TrimSpace(h))
+				resolveStep = stp
+			}
+		}
+		if resolvedHost != "" {
+			// Resolve host -> device id via adsDevice.
+			statusD, bodyD, errD := c.Gateway.Get("/ads/devices/" + url.PathEscape(resolvedHost))
+			stepD := models.Step{Tool: "adsDevice", Status: statusD}
+			if errD != nil {
+				stepD.Error = errD.Error()
+			} else {
+				stepD.Body = clipString(strings.TrimSpace(string(bodyD)), 2000)
+			}
+			if resolveStep != nil {
+				// Return this as part of steps later.
+			}
+			if errD == nil && statusD >= 200 && statusD < 300 {
+				var parsed map[string]any
+				if json.Unmarshal(bodyD, &parsed) == nil {
+					obj := parsed
+					if d, ok := parsed["data"].(map[string]any); ok {
+						obj = d
+					}
+					switch v := obj["id"].(type) {
+					case float64:
+						deviceID = int(v)
+					case int:
+						deviceID = v
+					}
+				}
+			}
+			// Stash host in conversation for follow-ups.
+			if conversationID != "" && resolvedHost != "" {
+				c.updateConversationHost(conversationID, resolvedHost)
+			}
+			// If we couldn't determine device ID, surface device lookup step.
+			if deviceID <= 0 {
+				steps := []models.Step{}
+				if resolveStep != nil {
+					steps = append(steps, *resolveStep)
+				}
+				steps = append(steps, stepD)
+				return models.ChatResponse{Answer: "Couldn't resolve device id for that host. Please provide a numeric device id.", Steps: steps}, true, nil
+			}
+		}
+	}
+
+	if deviceID <= 0 {
+		return models.ChatResponse{Answer: "Please provide a numeric device id (or a host name) to list its venues."}, true, nil
+	}
+	if conversationID != "" {
+		c.clearPending(conversationID)
+	}
+
+	path := fmt.Sprintf("/ads/devices/%d/venues?page=1&page_size=20", deviceID)
+	status, body, err := c.Gateway.Get(path)
+	step := models.Step{Tool: "adsDeviceVenues", Status: status}
+	if err != nil {
+		step.Error = err.Error()
+	} else {
+		step.Body = clipString(strings.TrimSpace(string(body)), 2000)
+	}
+	steps := []models.Step{step}
+	if resolveStep != nil {
+		steps = append([]models.Step{*resolveStep}, steps...)
+	}
+	if err != nil {
+		return models.ChatResponse{Answer: "Failed to fetch device venues: " + err.Error(), Steps: steps}, true, nil
+	}
+	// Fallback: some deployments treat the path parameter as host_name/server_id instead of numeric device ID.
+	// If the numeric endpoint fails server-side and we have a host, try the host-based variant.
+	if status >= 500 && strings.TrimSpace(resolvedHost) != "" {
+		hostPath := "/ads/devices/" + url.PathEscape(strings.TrimSpace(resolvedHost)) + "/venues?page=1&page_size=20"
+		statusH, bodyH, errH := c.Gateway.Get(hostPath)
+		stepH := models.Step{Tool: "adsDeviceVenuesByHost", Status: statusH}
+		if errH != nil {
+			stepH.Error = errH.Error()
+		} else {
+			stepH.Body = clipString(strings.TrimSpace(string(bodyH)), 2000)
+		}
+		steps = append(steps, stepH)
+		if errH == nil && statusH >= 200 && statusH < 300 {
+			// Use host-based response.
+			body = bodyH
+			status = statusH
+		}
+	}
+	if status < 200 || status >= 300 {
+		// Known backend issue: tool-gateway may return 500 due to a SQL scan mismatch.
+		if status >= 500 {
+			b := strings.TrimSpace(string(body))
+			if strings.Contains(b, "Failed to list venues by device") || strings.Contains(b, "expected") {
+				answer := "The venues-by-device endpoint is currently failing server-side (500). " +
+					"Workaround: use `list venues` to find a venue id, then `show devices in venue <id>` to see membership."
+				return models.ChatResponse{Answer: answer, Steps: steps}, true, nil
+			}
+		}
+		return models.ChatResponse{Answer: fmt.Sprintf("Failed to fetch device venues (status %d).", status), Steps: steps}, true, nil
+	}
+	var parsed map[string]any
+	if json.Unmarshal(body, &parsed) != nil {
+		return models.ChatResponse{Answer: "Device venues response could not be parsed.", Steps: steps}, true, nil
+	}
+	rowsAny, _ := parsed["data"].([]any)
+	if len(rowsAny) == 0 {
+		return models.ChatResponse{Answer: fmt.Sprintf("No venues found for device %d.", deviceID), Steps: steps}, true, nil
+	}
+	header := fmt.Sprintf("Venues for device %d:", deviceID)
+	if strings.TrimSpace(resolvedHost) != "" {
+		header = fmt.Sprintf("Venues for %s (device %d):", strings.TrimSpace(resolvedHost), deviceID)
+	}
+	lines := []string{header}
+	for _, it := range rowsAny {
+		if len(lines)-1 >= 10 {
+			break
+		}
+		m, ok := it.(map[string]any)
+		if !ok {
+			continue
+		}
+		name, _ := m["name"].(string)
+		idNum := 0
+		switch v := m["id"].(type) {
+		case float64:
+			idNum = int(v)
+		case int:
+			idNum = v
+		}
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		if idNum > 0 {
+			lines = append(lines, fmt.Sprintf("- %s (%d)", name, idNum))
+		} else {
+			lines = append(lines, "- "+name)
+		}
+	}
+	answer := strings.Join(lines, "\n")
+	if onToken != nil {
+		onToken(answer)
+	}
+	return models.ChatResponse{Answer: answer, Steps: steps}, true, nil
+}
+
+func (c *ChatService) handleDeviceDetails(ctx context.Context, req models.ChatRequest, onToken func(string)) (models.ChatResponse, bool, error) {
+	msgLower := strings.ToLower(req.Message)
+	if !(strings.Contains(msgLower, "device") || strings.Contains(msgLower, "kiosk") || strings.Contains(msgLower, "server")) {
+		return models.ChatResponse{}, false, nil
+	}
+	// If the user is asking for kiosk-wise analytics in a conversation that already has a poster context,
+	// let the poster POP/play-count handlers handle it instead of returning device details.
+	if strings.Contains(msgLower, "kiosk wise") || strings.Contains(msgLower, "kiosk-wise") || strings.Contains(msgLower, "kioskwise") || strings.Contains(msgLower, "kiosks wise") || strings.Contains(msgLower, "kiosks-wise") {
+		conversationID := strings.TrimSpace(req.ConversationID)
+		if conversationID != "" {
+			if st := c.getConversationState(conversationID); st != nil {
+				if strings.TrimSpace(st.PosterID) != "" || strings.TrimSpace(st.PosterName) != "" {
+					return models.ChatResponse{}, false, nil
+				}
+			}
+		}
+	}
+	// POP questions should be handled by POP handlers.
+	if strings.Contains(msgLower, "pop") {
+		return models.ChatResponse{}, false, nil
+	}
+	// Venue-related queries should be handled by venue-specific handlers.
+	if strings.Contains(msgLower, "venue") || strings.Contains(msgLower, "venues") {
+		return models.ChatResponse{}, false, nil
+	}
+	// Avoid colliding with telemetry handler.
+	if strings.Contains(msgLower, "metric") || strings.Contains(msgLower, "telemetry") || strings.Contains(msgLower, "internet") || strings.Contains(msgLower, "usage") {
+		return models.ChatResponse{}, false, nil
+	}
+	if !(strings.Contains(msgLower, "detail") || strings.Contains(msgLower, "info") || strings.Contains(msgLower, "show") || strings.Contains(msgLower, "get")) {
+		return models.ChatResponse{}, false, nil
+	}
+	if c.Gateway == nil {
+		return models.ChatResponse{Answer: "Tool gateway is not configured."}, true, nil
+	}
+
+	conversationID := strings.TrimSpace(req.ConversationID)
+	host := ""
+	if tokens := detectHostTokens(req.Message); len(tokens) > 0 {
+		candidate := strings.ToLower(strings.TrimSpace(tokens[0]))
+		parts := strings.Split(strings.ReplaceAll(candidate, "_", "-"), "-")
+		if len(parts) >= 3 {
+			host = candidate
+		}
+	}
+	var resolveStep *models.Step
+	resolveNameCandidate := func(msg string) string {
+		cleaned := msg
+		// Strip common command words but keep meaningful display-name tokens like "Kiosk-1".
+		for _, w := range []string{"show", "get", "give", "tell", "me", "the", "a", "an", "please", "device", "devices", "kiosk", "kiosks", "server", "info", "detail", "details"} {
+			cleaned = strings.ReplaceAll(cleaned, w, "")
+			cleaned = strings.ReplaceAll(cleaned, strings.Title(w), "")
+		}
+		cleaned = strings.ReplaceAll(cleaned, "?", " ")
+		cleaned = strings.ReplaceAll(cleaned, ":", " ")
+		cleaned = strings.TrimSpace(cleaned)
+		cleaned = strings.Join(strings.Fields(cleaned), " ")
+		return cleaned
+	}
+	if host == "" && conversationID != "" {
+		// Only reuse the remembered host for *generic* follow-ups.
+		// If the user provided a kiosk/display name, resolve fresh instead of inheriting a stale host.
+		candidate := resolveNameCandidate(req.Message)
+		if strings.TrimSpace(candidate) == "" {
+			if st := c.getConversationState(conversationID); st != nil {
+				if strings.TrimSpace(st.Host) != "" {
+					host = strings.ToLower(strings.TrimSpace(st.Host))
+				}
+			}
+		}
+	}
+	if host == "" {
+		candidate := resolveNameCandidate(req.Message)
+		query := req.Message
+		resolveConversationID := conversationID
+		if candidate != "" {
+			query = candidate
+			// For explicit kiosk/display-name queries, don't constrain resolution by remembered city/region.
+			resolveConversationID = ""
+		}
+		if resolved, step := c.resolveHostFromDeviceName(ctx, resolveConversationID, query); strings.TrimSpace(resolved) != "" {
+			host = strings.ToLower(strings.TrimSpace(resolved))
+			resolveStep = step
+		}
+	}
+	if host == "" {
+		// Second pass: if the first pass failed, try resolving with just the name parts.
+		// Sometimes the search query is too specific with "device info" or "show".
+		cleaned := req.Message
+		cleaned = strings.ReplaceAll(cleaned, "show", "")
+		cleaned = strings.ReplaceAll(cleaned, "device", "")
+		cleaned = strings.ReplaceAll(cleaned, "info", "")
+		cleaned = strings.ReplaceAll(cleaned, "detail", "")
+		cleaned = strings.TrimSpace(cleaned)
+		if cleaned != "" && cleaned != req.Message {
+			// Second pass is also name-driven; avoid stale geo constraints.
+			if resolved, step := c.resolveHostFromDeviceName(ctx, "", cleaned); strings.TrimSpace(resolved) != "" {
+				host = strings.ToLower(strings.TrimSpace(resolved))
+				resolveStep = step
+			}
+		}
+	}
+	if host == "" {
+		return models.ChatResponse{Answer: "Please specify a device/kiosk host (for example: moco-brt-briggs-001) or a kiosk display name."}, true, nil
+	}
+	if conversationID != "" {
+		c.updateConversationHost(conversationID, host)
+		c.clearPending(conversationID)
+	}
+
+	path := "/ads/devices/" + url.PathEscape(host)
+	status, body, err := c.Gateway.Get(path)
+	step := models.Step{Tool: "adsDevice", Status: status}
+	if err != nil {
+		step.Error = err.Error()
+	} else {
+		step.Body = clipString(strings.TrimSpace(string(body)), 2000)
+	}
+	steps := []models.Step{step}
+	if resolveStep != nil {
+		steps = append([]models.Step{*resolveStep}, steps...)
+	}
+	if err != nil {
+		return models.ChatResponse{Answer: "Failed to fetch device details: " + err.Error(), Steps: steps}, true, nil
+	}
+	if status < 200 || status >= 300 {
+		return models.ChatResponse{Answer: fmt.Sprintf("Failed to fetch device details (status %d).", status), Steps: steps}, true, nil
+	}
+
+	var parsed map[string]any
+	if json.Unmarshal(body, &parsed) != nil {
+		return models.ChatResponse{Answer: "Device details response could not be parsed.", Steps: steps}, true, nil
+	}
+	// Accept both {data:{...}} and direct object.
+	obj := parsed
+	if d, ok := parsed["data"].(map[string]any); ok {
+		obj = d
+	}
+	name, _ := obj["name"].(string)
+	desc, _ := obj["description"].(string)
+	hostName, _ := obj["host_name"].(string)
+	if strings.TrimSpace(hostName) == "" {
+		hostName = host
+	}
+	deviceID := 0
+	switch v := obj["id"].(type) {
+	case float64:
+		deviceID = int(v)
+	case int:
+		deviceID = v
+	}
+	city := ""
+	region := ""
+	if cfg, ok := obj["device_config"].(map[string]any); ok {
+		if s, ok := cfg["city"].(string); ok {
+			city = s
+		}
+	}
+	if regObj, ok := obj["region"].(map[string]any); ok {
+		if s, ok := regObj["code"].(string); ok {
+			region = s
+		}
+	}
+
+	lines := []string{
+		fmt.Sprintf("Device details for %s:", strings.TrimSpace(hostName)),
+	}
+	lines = append(lines, "Host: "+strings.TrimSpace(hostName))
+	if deviceID > 0 {
+		lines = append(lines, fmt.Sprintf("Device ID: %d", deviceID))
+	}
+	if strings.TrimSpace(name) != "" {
+		lines = append(lines, "Name: "+strings.TrimSpace(name))
+	}
+	if strings.TrimSpace(city) != "" {
+		lines = append(lines, "City: "+strings.TrimSpace(city))
+	}
+	if strings.TrimSpace(region) != "" {
+		lines = append(lines, "Region: "+strings.TrimSpace(region))
+	}
+	if strings.TrimSpace(desc) != "" {
+		lines = append(lines, "Description: "+strings.TrimSpace(desc))
+	}
+	answer := strings.Join(lines, "\n")
+	if onToken != nil {
+		onToken(answer)
+	}
+	return models.ChatResponse{Answer: answer, Steps: steps}, true, nil
+}
+
+func (c *ChatService) handleAdvertiserSearchList(ctx context.Context, req models.ChatRequest, onToken func(string)) (models.ChatResponse, bool, error) {
+	msgLower := strings.ToLower(req.Message)
+	if !(strings.Contains(msgLower, "advertiser") || strings.Contains(msgLower, "advertisers")) {
+		return models.ChatResponse{}, false, nil
+	}
+	if c.Gateway == nil {
+		return models.ChatResponse{Answer: "Tool gateway is not configured."}, true, nil
+	}
+
+	isSearch := strings.Contains(msgLower, "search") || strings.Contains(msgLower, "find")
+	isList := strings.Contains(msgLower, "list") || strings.Contains(msgLower, "show") || strings.Contains(msgLower, "all")
+	if !(isSearch || isList) {
+		return models.ChatResponse{}, false, nil
+	}
+
+	query := ""
+	if isSearch {
+		query = extractAfterKeyword(msgLower, "advertisers")
+		if query == "" {
+			query = extractAfterKeyword(msgLower, "advertiser")
+		}
+		query = strings.TrimSpace(query)
+		if query == "" {
+			return models.ChatResponse{Answer: "Please provide an advertiser search query (for example: search advertisers Pepsi)."}, true, nil
+		}
+	}
+
+	status, body, err := c.Gateway.Get("/ads/advertisers")
+	step := models.Step{Tool: "adsAdvertisers", Status: status}
+	if err != nil {
+		step.Error = err.Error()
+	} else {
+		step.Body = clipString(strings.TrimSpace(string(body)), 2000)
+	}
+	steps := []models.Step{step}
+	if err != nil {
+		return models.ChatResponse{Answer: "Failed to fetch advertisers: " + err.Error(), Steps: steps}, true, nil
+	}
+	if status < 200 || status >= 300 {
+		return models.ChatResponse{Answer: fmt.Sprintf("Failed to fetch advertisers (status %d).", status), Steps: steps}, true, nil
+	}
+	var parsed map[string]any
+	if json.Unmarshal(body, &parsed) != nil {
+		return models.ChatResponse{Answer: "Advertisers response could not be parsed.", Steps: steps}, true, nil
+	}
+	rowsAny, _ := parsed["data"].([]any)
+	if len(rowsAny) == 0 {
+		return models.ChatResponse{Answer: "No advertisers found.", Steps: steps}, true, nil
+	}
+
+	// Filter for search.
+	rows := make([]map[string]any, 0, len(rowsAny))
+	qLower := strings.ToLower(query)
+	for _, it := range rowsAny {
+		m, ok := it.(map[string]any)
+		if !ok {
+			continue
+		}
+		name, _ := m["name"].(string)
+		id, _ := m["id"].(string)
+		name = strings.TrimSpace(name)
+		id = strings.TrimSpace(id)
+		if name == "" || id == "" {
+			continue
+		}
+		if isSearch {
+			if !strings.Contains(strings.ToLower(name), qLower) {
+				continue
+			}
+		}
+		rows = append(rows, m)
+	}
+
+	if len(rows) == 0 {
+		return models.ChatResponse{Answer: fmt.Sprintf("No advertisers found for query '%s'.", query), Steps: steps}, true, nil
+	}
+
+	limit := 10
+	lines := make([]string, 0, limit+1)
+	if isSearch {
+		lines = append(lines, fmt.Sprintf("Advertiser search results for '%s':", query))
+	} else {
+		lines = append(lines, "Advertisers:")
+	}
+	for _, m := range rows {
+		if len(lines)-1 >= limit {
+			break
+		}
+		name, _ := m["name"].(string)
+		id, _ := m["id"].(string)
+		name = strings.TrimSpace(name)
+		id = strings.TrimSpace(id)
+		if name == "" || id == "" {
+			continue
+		}
+		lines = append(lines, fmt.Sprintf("- %s (%s)", name, id))
+	}
 	answer := strings.Join(lines, "\n")
 	if onToken != nil {
 		onToken(answer)
@@ -653,6 +3138,12 @@ type conversationState struct {
 	City           string
 	Region         string
 	Host           string
+	PosterName     string
+	PosterID       string
+	PosterCity     string
+	PosterRegion   string
+	CampaignID     string
+	VenueID        int
 	PendingHandler string
 	PendingMessage string
 	UpdatedAt      time.Time
@@ -668,7 +3159,7 @@ func (c *ChatService) ensureConversationStateHydrated(ctx context.Context, owner
 		return
 	}
 	// If we already have any useful state, don't re-hydrate.
-	if strings.TrimSpace(st.City) != "" || strings.TrimSpace(st.Region) != "" || strings.TrimSpace(st.Host) != "" {
+	if strings.TrimSpace(st.City) != "" || strings.TrimSpace(st.Region) != "" || strings.TrimSpace(st.Host) != "" || strings.TrimSpace(st.PosterName) != "" || strings.TrimSpace(st.PosterID) != "" || strings.TrimSpace(st.PosterCity) != "" || strings.TrimSpace(st.PosterRegion) != "" {
 		return
 	}
 	if c.Store == nil {
@@ -689,12 +3180,93 @@ func (c *ChatService) ensureConversationStateHydrated(ctx context.Context, owner
 	cityRe := regexp.MustCompile(`(?i)city\s+'([a-z0-9_-]+)'`)
 	regionRe := regexp.MustCompile(`(?i)region\s+'([a-z0-9_-]+)'`)
 
+	campaignID := ""
+	venueID := 0
+	posterName := ""
+	posterID := ""
+	posterCity := ""
+	posterRegion := ""
+
+	posterRe := regexp.MustCompile(`(?i)poster\s+'([^']+)'`)
+	posterCityRe := regexp.MustCompile(`(?i)poster\s+city\s+'([a-z0-9_-]+)'`)
+	posterRegionRe := regexp.MustCompile(`(?i)poster\s+region\s+'([a-z0-9_-]+)'`)
+
 	for _, m := range msgs {
 		content := strings.TrimSpace(m.Content)
 		if content == "" {
 			continue
 		}
 		lower := strings.ToLower(content)
+
+		// Best-effort: infer poster memory from user questions like:
+		// "play count of poster Lorla Studio from brt region".
+		if strings.Contains(lower, "poster") && (strings.Contains(lower, "play count") || strings.Contains(lower, "plays")) {
+			if posterName == "" {
+				pn := strings.TrimSpace(extractAfterKeywordOriginal(content, "poster"))
+				pnLower := strings.ToLower(pn)
+				if strings.Contains(pnLower, " from ") {
+					pn = strings.TrimSpace(strings.SplitN(pn, " from ", 2)[0])
+					pnLower = strings.ToLower(pn)
+				}
+				if strings.Contains(pnLower, " in ") {
+					pn = strings.TrimSpace(strings.SplitN(pn, " in ", 2)[0])
+					pnLower = strings.ToLower(pn)
+				}
+				if strings.Contains(pnLower, " for ") {
+					pn = strings.TrimSpace(strings.SplitN(pn, " for ", 2)[0])
+					pnLower = strings.ToLower(pn)
+				}
+				if strings.TrimSpace(pn) != "" {
+					posterName = strings.TrimSpace(pn)
+				}
+			}
+			if posterCity == "" {
+				if cty := c.detectCityCode(ctx, lower); cty != "" {
+					posterCity = strings.ToLower(strings.TrimSpace(cty))
+				}
+			}
+			if posterRegion == "" {
+				if reg := c.detectRegionCode(ctx, lower); reg != "" {
+					posterRegion = strings.ToLower(strings.TrimSpace(reg))
+				}
+			}
+		}
+
+		// Best-effort: infer poster id from messages like:
+		// "POP for poster <name> (<uuid>) ..." or user messages containing a UUID.
+		if posterID == "" {
+			if strings.Contains(lower, "poster") {
+				if id := extractCampaignID(content); looksLikeUUID(id) {
+					posterID = id
+				}
+			}
+		}
+
+		if mm := posterRe.FindStringSubmatch(content); len(mm) == 2 {
+			if strings.TrimSpace(mm[1]) != "" {
+				posterName = strings.TrimSpace(mm[1])
+			}
+		}
+		if mm := posterCityRe.FindStringSubmatch(content); len(mm) == 2 {
+			if strings.TrimSpace(mm[1]) != "" {
+				posterCity = strings.ToLower(strings.TrimSpace(mm[1]))
+			}
+		}
+		if mm := posterRegionRe.FindStringSubmatch(content); len(mm) == 2 {
+			if strings.TrimSpace(mm[1]) != "" {
+				posterRegion = strings.ToLower(strings.TrimSpace(mm[1]))
+			}
+		}
+
+		if id := extractCampaignID(content); looksLikeUUID(id) {
+			campaignID = id
+		}
+		if vid := extractFirstInt(content); vid > 0 {
+			// Best-effort: only treat as venue id if message mentions venue.
+			if strings.Contains(lower, "venue") {
+				venueID = vid
+			}
+		}
 
 		if h := detectHostTokens(content); len(h) > 0 {
 			candidate := strings.ToLower(strings.TrimSpace(h[0]))
@@ -735,7 +3307,783 @@ func (c *ChatService) ensureConversationStateHydrated(ctx context.Context, owner
 	if strings.TrimSpace(host) != "" {
 		st.Host = strings.ToLower(strings.TrimSpace(host))
 	}
+	if strings.TrimSpace(posterName) != "" {
+		st.PosterName = strings.TrimSpace(posterName)
+	}
+	if looksLikeUUID(posterID) {
+		st.PosterID = posterID
+	}
+	if strings.TrimSpace(posterCity) != "" {
+		st.PosterCity = strings.ToLower(strings.TrimSpace(posterCity))
+	}
+	if strings.TrimSpace(posterRegion) != "" {
+		st.PosterRegion = strings.ToLower(strings.TrimSpace(posterRegion))
+	}
+	if looksLikeUUID(campaignID) {
+		st.CampaignID = campaignID
+	}
+	if venueID > 0 {
+		st.VenueID = venueID
+	}
 	st.UpdatedAt = time.Now()
+}
+
+func (c *ChatService) updateConversationPoster(conversationID, posterName, city, region string) {
+	id := strings.TrimSpace(conversationID)
+	if id == "" {
+		return
+	}
+	st := c.getConversationState(id)
+	if st == nil {
+		return
+	}
+	p := strings.TrimSpace(posterName)
+	if p != "" {
+		st.PosterName = p
+	}
+	if strings.TrimSpace(city) != "" {
+		st.PosterCity = strings.ToLower(strings.TrimSpace(city))
+	}
+	if strings.TrimSpace(region) != "" {
+		st.PosterRegion = strings.ToLower(strings.TrimSpace(region))
+	}
+	st.UpdatedAt = time.Now()
+}
+
+func (c *ChatService) updateConversationPosterID(conversationID, posterID string) {
+	st := c.getConversationState(conversationID)
+	if st == nil {
+		return
+	}
+	if looksLikeUUID(posterID) {
+		st.PosterID = posterID
+		st.UpdatedAt = time.Now()
+	}
+}
+
+func (c *ChatService) handlePosterPlayCount(ctx context.Context, req models.ChatRequest, onToken func(string)) (models.ChatResponse, bool, error) {
+	msgLower := strings.ToLower(req.Message)
+	conversationID := strings.TrimSpace(req.ConversationID)
+	isKioskWise := strings.Contains(msgLower, "kiosk wise") || strings.Contains(msgLower, "kiosk-wise") || strings.Contains(msgLower, "kioskwise") || strings.Contains(msgLower, "kiosks wise") || strings.Contains(msgLower, "kiosks-wise") || strings.Contains(msgLower, "by kiosk") || strings.Contains(msgLower, "by kiosks")
+	isSameFollowup := isKioskWise && (strings.Contains(msgLower, "same") || strings.Contains(msgLower, "same as") || strings.Contains(msgLower, "same kiosk"))
+	isWholeKioskWiseFollowup := false
+	hasPlayCount := strings.Contains(msgLower, "play count") || strings.Contains(msgLower, "plays")
+	hasPosterWord := strings.Contains(msgLower, "poster")
+	hasAdWord := strings.Contains(msgLower, " ad ") || strings.HasSuffix(strings.TrimSpace(msgLower), " ad") || strings.Contains(msgLower, " creative ") || strings.HasSuffix(strings.TrimSpace(msgLower), " creative")
+
+	if isKioskWise && !hasPosterWord && !hasPlayCount {
+		// Follow-up like: "get me whole kiosks wise data" after a poster-specific query.
+		// Only treat it as poster analytics if conversation memory already has poster context.
+		if (strings.Contains(msgLower, "whole") || strings.Contains(msgLower, "all") || strings.Contains(msgLower, "overall") || strings.Contains(msgLower, "entire") || strings.Contains(msgLower, "data")) && conversationID != "" {
+			if st := c.getConversationState(conversationID); st != nil {
+				if strings.TrimSpace(st.PosterID) != "" || strings.TrimSpace(st.PosterName) != "" {
+					isWholeKioskWiseFollowup = true
+				}
+			}
+		}
+		if isWholeKioskWiseFollowup {
+			hasPlayCount = true
+		}
+	}
+
+	// Explicit query: requires poster + play count.
+	// Follow-up query: allow "same kiosk wise" (or "whole kiosks wise data") to reuse poster + scope from conversation memory.
+	if !hasPosterWord && !isSameFollowup && !isWholeKioskWiseFollowup && !(hasPlayCount && hasAdWord) {
+		return models.ChatResponse{}, false, nil
+	}
+	// Allow ad/creative phrasing: "play count of <ad name> ..." (no "poster" keyword).
+	if !hasPlayCount && !isSameFollowup && !isWholeKioskWiseFollowup {
+		return models.ChatResponse{}, false, nil
+	}
+	if c.Gateway == nil {
+		return models.ChatResponse{Answer: "Tool gateway is not configured."}, true, nil
+	}
+	if isSameFollowup {
+		isKioskWise = true
+	}
+	if isWholeKioskWiseFollowup {
+		isKioskWise = true
+	}
+	if !hasPosterWord {
+		// If the user didn't say "poster", still treat it as a poster play-count query when
+		// they used "play count" and mention an ad/creative.
+		if !isSameFollowup && !isWholeKioskWiseFollowup && !(hasPlayCount && hasAdWord) {
+			return models.ChatResponse{}, false, nil
+		}
+	}
+
+	// Extract poster name (preserve original casing for poster_name query).
+	posterName := ""
+	if strings.Contains(msgLower, " posters") || strings.HasPrefix(msgLower, "posters ") || strings.Contains(msgLower, " posters ") {
+		low := strings.ToLower(req.Message)
+		idx := strings.Index(low, " posters")
+		if idx < 0 {
+			idx = strings.Index(low, " posters ")
+		}
+		if idx >= 0 {
+			posterName = strings.TrimSpace(req.Message[:idx])
+		}
+	} else if hasPosterWord {
+		posterName = strings.TrimSpace(extractAfterKeywordOriginal(req.Message, "poster"))
+	} else {
+		// Handle: "play count of <name> ...".
+		posterName = strings.TrimSpace(extractAfterKeywordOriginal(req.Message, "play count of"))
+		if posterName == "" {
+			posterName = strings.TrimSpace(extractAfterKeywordOriginal(req.Message, "plays of"))
+		}
+	}
+	posterName = strings.TrimSpace(strings.TrimSuffix(posterName, "kiosk wise"))
+	posterName = strings.TrimSpace(strings.TrimSuffix(posterName, "kiosk-wise"))
+	posterNameLower := strings.ToLower(posterName)
+	if strings.Contains(posterNameLower, " from ") {
+		posterName = strings.TrimSpace(strings.SplitN(posterName, " from ", 2)[0])
+		posterNameLower = strings.ToLower(posterName)
+	}
+	if strings.Contains(posterNameLower, " in ") {
+		posterName = strings.TrimSpace(strings.SplitN(posterName, " in ", 2)[0])
+		posterNameLower = strings.ToLower(posterName)
+	}
+	if strings.Contains(posterNameLower, " for ") {
+		posterName = strings.TrimSpace(strings.SplitN(posterName, " for ", 2)[0])
+		posterNameLower = strings.ToLower(posterName)
+	}
+	// Strip a trailing "ad"/"creative" token from the extracted name.
+	posterNameLower = strings.ToLower(strings.TrimSpace(posterName))
+	if strings.HasSuffix(posterNameLower, " ad") {
+		posterName = strings.TrimSpace(posterName[:len(posterName)-len(" ad")])
+	}
+	posterNameLower = strings.ToLower(strings.TrimSpace(posterName))
+	if strings.HasSuffix(posterNameLower, " creative") {
+		posterName = strings.TrimSpace(posterName[:len(posterName)-len(" creative")])
+	}
+	posterIDFromMem := ""
+	if conversationID != "" {
+		if st := c.getConversationState(conversationID); st != nil {
+			if strings.TrimSpace(st.PosterID) != "" {
+				posterIDFromMem = strings.TrimSpace(st.PosterID)
+			}
+			if posterName == "" && strings.TrimSpace(st.PosterName) != "" {
+				posterName = strings.TrimSpace(st.PosterName)
+			}
+		}
+	}
+	if strings.Contains(strings.ToLower(posterName), "interpreted request") || strings.Contains(posterName, "poster=") {
+		posterName = ""
+	}
+	if posterName == "" {
+		if looksLikeUUID(posterIDFromMem) {
+			posterName = posterIDFromMem
+		} else {
+			return models.ChatResponse{Answer: "Please specify a poster name (for example: play count of poster Lorla Studio)."}, true, nil
+		}
+	}
+
+	city := c.detectCityCode(ctx, msgLower)
+	region := c.detectRegionCode(ctx, msgLower)
+	// Reuse last poster scope for follow-ups like "same kiosk wise".
+	if city == "" && region == "" && conversationID != "" {
+		if st := c.getConversationState(conversationID); st != nil {
+			if strings.TrimSpace(st.PosterRegion) != "" {
+				region = strings.ToLower(strings.TrimSpace(st.PosterRegion))
+			}
+			if strings.TrimSpace(st.PosterCity) != "" {
+				city = strings.ToLower(strings.TrimSpace(st.PosterCity))
+			}
+			// Fallback to general scope memory if poster-specific scope isn't available.
+			if region == "" && strings.TrimSpace(st.Region) != "" {
+				region = strings.ToLower(strings.TrimSpace(st.Region))
+			}
+			if city == "" && strings.TrimSpace(st.City) != "" {
+				city = strings.ToLower(strings.TrimSpace(st.City))
+			}
+		}
+	}
+	if city == "" && region == "" {
+		return models.ChatResponse{Answer: "Please specify a city or region code (for example: moco or brt)."}, true, nil
+	}
+	if conversationID != "" {
+		c.updateConversationPoster(conversationID, posterName, city, region)
+		c.clearPending(conversationID)
+	}
+
+	// Pull POP rows filtered by poster_name (or poster_id) + scope.
+	type popItem struct {
+		PosterName  string    `json:"poster_name"`
+		PosterID    string    `json:"poster_id"`
+		HostName    string    `json:"host_name"`
+		KioskName   string    `json:"kiosk_name"`
+		PosterType  string    `json:"poster_type"`
+		PopDatetime time.Time `json:"pop_datetime"`
+		City        string    `json:"city"`
+		Region      string    `json:"region"`
+		PlayCount   int64     `json:"play_count"`
+	}
+	type popListResponse struct {
+		Items    []popItem `json:"items"`
+		Total    int64     `json:"total"`
+		Page     int       `json:"page"`
+		PageSize int       `json:"page_size"`
+	}
+
+	fromRFC, toRFC := extractDateRangeRFC3339(msgLower)
+	if fromRFC == "" && toRFC == "" {
+		fromRFC, toRFC = extractNaturalDateRangeRFC3339(req.Message)
+	}
+
+	page := 1
+	pageSize := 200
+	maxPages := 10
+	steps := make([]models.Step, 0, 2)
+	items := make([]popItem, 0, 64)
+	for {
+		posterQueryKey := "poster_name"
+		if looksLikeUUID(posterName) {
+			posterQueryKey = "poster_id"
+		}
+		basePath := fmt.Sprintf("/pop?%s=%s&page=%d&page_size=%d", posterQueryKey, urlEscape(posterName), page, pageSize)
+		if strings.TrimSpace(fromRFC) != "" && strings.TrimSpace(toRFC) != "" {
+			basePath += "&from=" + urlEscape(fromRFC) + "&to=" + urlEscape(toRFC)
+		}
+		path := basePath
+		if strings.TrimSpace(region) != "" {
+			path += "&region=" + urlEscape(region)
+		} else if strings.TrimSpace(city) != "" {
+			path += "&city=" + urlEscape(city)
+		}
+		status, body, err := c.Gateway.Get(path)
+		if err == nil && status == 400 && strings.TrimSpace(fromRFC) != "" && strings.TrimSpace(toRFC) != "" {
+			pathNoDates := fmt.Sprintf("/pop?%s=%s&page=%d&page_size=%d", posterQueryKey, urlEscape(posterName), page, pageSize)
+			if strings.TrimSpace(region) != "" {
+				pathNoDates += "&region=" + urlEscape(region)
+			} else if strings.TrimSpace(city) != "" {
+				pathNoDates += "&city=" + urlEscape(city)
+			}
+			status2, body2, err2 := c.Gateway.Get(pathNoDates)
+			step2 := models.Step{Tool: "popList", Status: status2}
+			if err2 != nil {
+				step2.Error = err2.Error()
+			} else {
+				step2.Body = clipString(strings.TrimSpace(string(body2)), 2000)
+			}
+			steps = append(steps, step2)
+			status, body, err = status2, body2, err2
+		}
+		step := models.Step{Tool: "popList", Status: status}
+		if err != nil {
+			step.Error = err.Error()
+		} else {
+			step.Body = clipString(strings.TrimSpace(string(body)), 2000)
+		}
+		steps = append(steps, step)
+		if err != nil {
+			return models.ChatResponse{Answer: "Failed to fetch POP data: " + err.Error(), Steps: steps}, true, nil
+		}
+		if status < 200 || status >= 300 {
+			return models.ChatResponse{Answer: fmt.Sprintf("Failed to fetch POP data (status %d).", status), Steps: steps}, true, nil
+		}
+		var resp popListResponse
+		if json.Unmarshal(body, &resp) != nil {
+			return models.ChatResponse{Answer: "POP list response could not be parsed.", Steps: steps}, true, nil
+		}
+		if len(resp.Items) == 0 {
+			break
+		}
+		items = append(items, resp.Items...)
+		if resp.Total > 0 {
+			if int64(page*pageSize) >= resp.Total {
+				break
+			}
+		} else if len(resp.Items) < pageSize {
+			break
+		}
+		page++
+		if page > maxPages {
+			break
+		}
+	}
+	if len(items) == 0 {
+		scopeLabel := ""
+		if strings.TrimSpace(region) != "" {
+			scopeLabel = "region '" + strings.TrimSpace(region) + "'"
+		} else {
+			scopeLabel = "city '" + strings.TrimSpace(city) + "'"
+		}
+		answer := fmt.Sprintf("No play counts found for poster '%s' in %s.", posterName, scopeLabel)
+		if onToken != nil {
+			onToken(answer)
+		}
+		return models.ChatResponse{Answer: answer, Steps: steps}, true, nil
+	}
+
+	totalPlays := int64(0)
+	for _, it := range items {
+		totalPlays += it.PlayCount
+	}
+
+	scopeLabel := ""
+	if strings.TrimSpace(region) != "" {
+		scopeLabel = "region '" + strings.TrimSpace(region) + "'"
+	} else {
+		scopeLabel = "city '" + strings.TrimSpace(city) + "'"
+	}
+
+	if !isKioskWise {
+		answer := fmt.Sprintf("Play count for poster '%s' in %s: %d plays.", posterName, scopeLabel, totalPlays)
+		if onToken != nil {
+			onToken(answer)
+		}
+		return models.ChatResponse{Answer: answer, Steps: steps}, true, nil
+	}
+
+	// Kiosk-wise aggregation.
+	type kv struct {
+		Key   string
+		Plays int64
+	}
+	byKiosk := map[string]int64{}
+	for _, it := range items {
+		k := strings.TrimSpace(it.KioskName)
+		if k == "" {
+			k = strings.TrimSpace(it.HostName)
+		}
+		if k == "" {
+			continue
+		}
+		byKiosk[k] += it.PlayCount
+	}
+	rows := make([]kv, 0, len(byKiosk))
+	for k, v := range byKiosk {
+		rows = append(rows, kv{Key: k, Plays: v})
+	}
+	sort.Slice(rows, func(i, j int) bool { return rows[i].Plays > rows[j].Plays })
+	if len(rows) > 10 {
+		rows = rows[:10]
+	}
+	lines := make([]string, 0, len(rows)+2)
+	lines = append(lines, fmt.Sprintf("Play count for poster '%s' in %s: %d plays", posterName, scopeLabel, totalPlays))
+	lines = append(lines, "Kiosk-wise:")
+	for i, r := range rows {
+		lines = append(lines, fmt.Sprintf("%d. %s — %d plays", i+1, r.Key, r.Plays))
+	}
+	answer := strings.Join(lines, "\n")
+	if onToken != nil {
+		onToken(answer)
+	}
+	return models.ChatResponse{Answer: answer, Steps: steps}, true, nil
+}
+
+func extractFirstInt(s string) int {
+	re := regexp.MustCompile(`\b(\d{1,9})\b`)
+	mm := re.FindStringSubmatch(s)
+	if len(mm) != 2 {
+		return 0
+	}
+	n, err := strconv.Atoi(mm[1])
+	if err != nil {
+		return 0
+	}
+	if n <= 0 {
+		return 0
+	}
+	return n
+}
+
+func extractExplicitDeviceID(msgLower string) int {
+	s := strings.ToLower(strings.TrimSpace(msgLower))
+	if s == "" {
+		return 0
+	}
+	// Only treat numbers as device IDs when explicitly provided as "device <id>" or "device id <id>".
+	re := regexp.MustCompile(`(?i)\bdevice\s+(?:id\s+)?(\d{1,9})\b`)
+	mm := re.FindStringSubmatch(s)
+	if len(mm) != 2 {
+		return 0
+	}
+	n, err := strconv.Atoi(mm[1])
+	if err != nil || n <= 0 {
+		return 0
+	}
+	return n
+}
+
+func (c *ChatService) updateConversationVenueID(conversationID string, venueID int) {
+	id := strings.TrimSpace(conversationID)
+	if id == "" || venueID <= 0 {
+		return
+	}
+	st := c.getConversationState(id)
+	if st == nil {
+		return
+	}
+	st.VenueID = venueID
+	st.UpdatedAt = time.Now()
+}
+
+func (c *ChatService) updateConversationCampaignID(conversationID, campaignID string) {
+	id := strings.TrimSpace(conversationID)
+	if id == "" {
+		return
+	}
+	st := c.getConversationState(id)
+	if st == nil {
+		return
+	}
+	cid := strings.TrimSpace(campaignID)
+	if cid == "" {
+		return
+	}
+	st.CampaignID = cid
+	st.UpdatedAt = time.Now()
+}
+
+func (c *ChatService) handleCampaignImpressions(ctx context.Context, req models.ChatRequest, onToken func(string)) (models.ChatResponse, bool, error) {
+	msgLower := strings.ToLower(req.Message)
+	if !strings.Contains(msgLower, "impression") {
+		return models.ChatResponse{}, false, nil
+	}
+	if c.Gateway == nil {
+		return models.ChatResponse{Answer: "Tool gateway is not configured."}, true, nil
+	}
+
+	conversationID := strings.TrimSpace(req.ConversationID)
+	campaignID := ""
+	if id := extractCampaignID(req.Message); looksLikeUUID(id) {
+		campaignID = id
+	} else if conversationID != "" {
+		if st := c.getConversationState(conversationID); st != nil {
+			if looksLikeUUID(st.CampaignID) {
+				campaignID = st.CampaignID
+			}
+		}
+	}
+
+	// If no UUID is present, try resolving by campaign name.
+	if !looksLikeUUID(campaignID) {
+		// Prefer extracting the name from "campaign <name>".
+		campaignName := extractAfterKeyword(msgLower, "campaign")
+		if campaignName == "" {
+			campaignName = extractAfterKeyword(msgLower, "campaign:")
+		}
+		campaignName = strings.TrimSpace(campaignName)
+		if campaignName != "" {
+			// First try the search endpoint.
+			statusS, bodyS, errS := c.Gateway.Get("/ads/campaigns/search?query=" + urlEscape(campaignName) + "&page=1&page_size=10")
+			stepSearch := models.Step{Tool: "adsCampaignsSearch", Status: statusS}
+			if errS != nil {
+				stepSearch.Error = errS.Error()
+			} else {
+				stepSearch.Body = clipString(strings.TrimSpace(string(bodyS)), 2000)
+			}
+			if errS == nil && statusS >= 200 && statusS < 300 {
+				var parsed map[string]any
+				if json.Unmarshal(bodyS, &parsed) == nil {
+					rows := extractCampaignRows(parsed)
+					if len(rows) == 1 {
+						if m, ok := rows[0].(map[string]any); ok {
+							id, _ := m["id"].(string)
+							if looksLikeUUID(id) {
+								campaignID = id
+							}
+						}
+					} else if len(rows) > 1 {
+						// Ambiguous; suggest top candidates.
+						sugs := formatCampaignSuggestions(rows, 5)
+						answer := "Multiple campaigns matched. Please specify the campaign id. Suggestions:\n" + strings.Join(sugs, "\n")
+						if onToken != nil {
+							onToken(answer)
+						}
+						return models.ChatResponse{Answer: answer, Steps: []models.Step{stepSearch}}, true, nil
+					}
+				}
+			}
+
+			// Fallback: reuse existing list-based resolver.
+			if !looksLikeUUID(campaignID) {
+				campaignID = c.resolveCampaignID(ctx, msgLower)
+			}
+		}
+	}
+
+	if !looksLikeUUID(campaignID) {
+		return models.ChatResponse{Answer: "Please provide a campaign id (UUID), or ask like: show impressions for campaign <name>."}, true, nil
+	}
+
+	if conversationID != "" {
+		c.updateConversationCampaignID(conversationID, campaignID)
+		c.clearPending(conversationID)
+	}
+
+	steps := make([]models.Step, 0, 2)
+
+	// Lifetime impressions (POP-backed) from ADS.
+	adsPath := "/ads/campaigns/" + urlEscape(campaignID) + "/impressions"
+	status, body, err := c.Gateway.Get(adsPath)
+	stepAds := models.Step{Tool: "adsCampaignImpressions", CampaignID: campaignID, Status: status}
+	if err != nil {
+		stepAds.Error = err.Error()
+	} else {
+		stepAds.Body = clipString(strings.TrimSpace(string(body)), 2000)
+	}
+	steps = append(steps, stepAds)
+
+	// Poster breakdown from POP (optional; may not be allowed by tool catalog).
+	status2 := 0
+	var body2 []byte
+	var err2 error
+	if c.Catalog == nil || c.Catalog.IsAllowed(ctx, "GET", "/pop/impressions") {
+		popPath := "/pop/impressions?campaign_id=" + urlEscape(campaignID)
+		status2, body2, err2 = c.Gateway.Get(popPath)
+		// Some gateway deployments return 403 {"error":"forbidden_path"} even if the OpenAPI spec lists the path.
+		// Treat this as an optional enrichment and don't surface it to the user.
+		if !(err2 == nil && status2 == 403 && strings.Contains(string(body2), "forbidden_path")) {
+			stepPop := models.Step{Tool: "popImpressions", CampaignID: campaignID, Status: status2}
+			if err2 != nil {
+				stepPop.Error = err2.Error()
+			} else {
+				stepPop.Body = clipString(strings.TrimSpace(string(body2)), 2000)
+			}
+			steps = append(steps, stepPop)
+		} else {
+			status2 = 0
+			body2 = nil
+			err2 = nil
+		}
+	}
+
+	// Prefer POP breakdown for the summary when available.
+	var popResp struct {
+		CampaignID  string `json:"campaign_id"`
+		Impressions int64  `json:"impressions"`
+		Posters     []struct {
+			PosterID    string `json:"poster_id"`
+			PosterName  string `json:"poster_name"`
+			Impressions int64  `json:"impressions"`
+			PlayTime    int64  `json:"play_time"`
+		} `json:"posters"`
+	}
+	if len(body2) > 0 {
+		_ = json.Unmarshal(body2, &popResp)
+	}
+
+	// ADS response is wrapped in {data:...}
+	var adsResp gwCampaignImpressionsResponse
+	_ = json.Unmarshal(body, &adsResp)
+
+	answer := ""
+	if err != nil || status < 200 || status >= 300 {
+		// If ADS impressions fail, fall back to POP impressions if possible.
+		if err2 == nil && status2 >= 200 && status2 < 300 && popResp.CampaignID != "" {
+			answer = fmt.Sprintf("Campaign %s impressions (from POP): %d total.", campaignID, popResp.Impressions)
+		} else {
+			msg := "Failed to fetch campaign impressions."
+			if err != nil {
+				msg += " " + err.Error()
+			}
+			answer = msg
+		}
+	} else {
+		total := int64(0)
+		if adsResp.Data != nil {
+			total = adsResp.Data.Impressions
+		}
+		if popResp.CampaignID != "" {
+			// Prefer POP total when present.
+			total = popResp.Impressions
+		}
+		answer = fmt.Sprintf("Campaign %s impressions: %d total.", campaignID, total)
+		if len(popResp.Posters) > 0 {
+			// Show top 5 posters by impressions.
+			sort.Slice(popResp.Posters, func(i, j int) bool { return popResp.Posters[i].Impressions > popResp.Posters[j].Impressions })
+			lines := make([]string, 0, 6)
+			lines = append(lines, answer)
+			max := 5
+			if len(popResp.Posters) < max {
+				max = len(popResp.Posters)
+			}
+			for i := 0; i < max; i++ {
+				p := popResp.Posters[i]
+				name := strings.TrimSpace(p.PosterName)
+				if name == "" {
+					name = p.PosterID
+				}
+				lines = append(lines, fmt.Sprintf("%d. %s — %d impressions", i+1, name, p.Impressions))
+			}
+			answer = strings.Join(lines, "\n")
+		}
+	}
+
+	if onToken != nil {
+		onToken(answer)
+	}
+	resp := models.ChatResponse{Answer: answer, Steps: steps}
+	if popResp.CampaignID != "" {
+		data := &models.ChatData{CampaignImpressions: &models.CampaignImpressions{CampaignID: popResp.CampaignID, Impressions: popResp.Impressions}}
+		if len(popResp.Posters) > 0 {
+			posters := make([]models.PosterImpression, 0, len(popResp.Posters))
+			for _, p := range popResp.Posters {
+				pt := p.PlayTime
+				posters = append(posters, models.PosterImpression{PosterID: p.PosterID, PosterName: p.PosterName, Impressions: p.Impressions, PlayTime: &pt})
+			}
+			data.CampaignImpressions.Posters = posters
+		}
+		resp.Data = data
+	}
+	return resp, true, nil
+}
+
+func (c *ChatService) handleCampaignSearchList(ctx context.Context, req models.ChatRequest, onToken func(string)) (models.ChatResponse, bool, error) {
+	msgLower := strings.ToLower(req.Message)
+	if !(strings.Contains(msgLower, "campaign") || strings.Contains(msgLower, "campaigns")) {
+		return models.ChatResponse{}, false, nil
+	}
+	// If the user asked for campaign creatives, a dedicated handler should answer.
+	if strings.Contains(msgLower, "creative") {
+		return models.ChatResponse{}, false, nil
+	}
+	// Avoid colliding with impressions handler which has its own deterministic flow.
+	if strings.Contains(msgLower, "impression") {
+		return models.ChatResponse{}, false, nil
+	}
+	if c.Gateway == nil {
+		return models.ChatResponse{Answer: "Tool gateway is not configured."}, true, nil
+	}
+
+	conversationID := strings.TrimSpace(req.ConversationID)
+	isSearch := strings.Contains(msgLower, "search") || strings.Contains(msgLower, "find")
+	isList := strings.Contains(msgLower, "list") || strings.Contains(msgLower, "show") || strings.Contains(msgLower, "all")
+	if !(isSearch || isList) {
+		return models.ChatResponse{}, false, nil
+	}
+
+	statusFilter := extractStatusFilter(msgLower)
+	query := ""
+	if isSearch {
+		// Prefer the plural keyword first so we don't match "campaign" inside "campaigns".
+		query = extractAfterKeyword(msgLower, "campaigns")
+		if query == "" {
+			query = extractAfterKeyword(msgLower, "campaign")
+		}
+		query = strings.TrimSpace(query)
+		if query == "" {
+			return models.ChatResponse{Answer: "Please provide a campaign search query (for example: search campaigns Pepsi)."}, true, nil
+		}
+	}
+
+	steps := make([]models.Step, 0, 1)
+	rows := make([]any, 0)
+
+	if isSearch {
+		path := "/ads/campaigns/search?query=" + urlEscape(query) + "&page=1&page_size=20"
+		status, body, err := c.Gateway.Get(path)
+		step := models.Step{Tool: "adsCampaignsSearch", Status: status}
+		if err != nil {
+			step.Error = err.Error()
+		} else {
+			step.Body = clipString(strings.TrimSpace(string(body)), 2000)
+		}
+		steps = append(steps, step)
+		if err != nil {
+			return models.ChatResponse{Answer: "Failed to search campaigns: " + err.Error(), Steps: steps}, true, nil
+		}
+		if status < 200 || status >= 300 {
+			return models.ChatResponse{Answer: fmt.Sprintf("Failed to search campaigns (status %d).", status), Steps: steps}, true, nil
+		}
+		var parsed map[string]any
+		if json.Unmarshal(body, &parsed) != nil {
+			return models.ChatResponse{Answer: "Campaign search response could not be parsed.", Steps: steps}, true, nil
+		}
+		rows = extractCampaignRows(parsed)
+	} else {
+		path := "/ads/campaigns?page=1&page_size=50"
+		status, body, err := c.Gateway.Get(path)
+		step := models.Step{Tool: "adsCampaigns", Status: status}
+		if err != nil {
+			step.Error = err.Error()
+		} else {
+			step.Body = clipString(strings.TrimSpace(string(body)), 2000)
+		}
+		steps = append(steps, step)
+		if err != nil {
+			return models.ChatResponse{Answer: "Failed to list campaigns: " + err.Error(), Steps: steps}, true, nil
+		}
+		if status < 200 || status >= 300 {
+			return models.ChatResponse{Answer: fmt.Sprintf("Failed to list campaigns (status %d).", status), Steps: steps}, true, nil
+		}
+		var parsed map[string]any
+		if json.Unmarshal(body, &parsed) != nil {
+			return models.ChatResponse{Answer: "Campaign list response could not be parsed.", Steps: steps}, true, nil
+		}
+		rows = extractCampaignRows(parsed)
+	}
+
+	if len(rows) == 0 {
+		answer := "No campaigns found."
+		if isSearch {
+			answer = fmt.Sprintf("No campaigns found for query '%s'.", query)
+		}
+		return models.ChatResponse{Answer: answer, Steps: steps}, true, nil
+	}
+
+	// Apply optional status filter when present.
+	if statusFilter != "" {
+		filtered := make([]any, 0, len(rows))
+		for _, it := range rows {
+			m, ok := it.(map[string]any)
+			if !ok {
+				continue
+			}
+			st, _ := m["status"].(string)
+			if strings.EqualFold(strings.TrimSpace(st), statusFilter) {
+				filtered = append(filtered, it)
+			}
+		}
+		rows = filtered
+		if len(rows) == 0 {
+			return models.ChatResponse{Answer: fmt.Sprintf("No %s campaigns found.", statusFilter), Steps: steps}, true, nil
+		}
+	}
+
+	// If exactly one match, remember it.
+	if len(rows) == 1 && conversationID != "" {
+		if m, ok := rows[0].(map[string]any); ok {
+			id, _ := m["id"].(string)
+			if looksLikeUUID(id) {
+				c.updateConversationCampaignID(conversationID, id)
+			}
+		}
+	}
+
+	limit := 10
+	lines := make([]string, 0, limit+1)
+	if isSearch {
+		lines = append(lines, fmt.Sprintf("Campaign search results for '%s':", query))
+	} else if statusFilter != "" {
+		lines = append(lines, fmt.Sprintf("Campaigns (%s):", statusFilter))
+	} else {
+		lines = append(lines, "Campaigns:")
+	}
+	for _, it := range rows {
+		if len(lines)-1 >= limit {
+			break
+		}
+		m, ok := it.(map[string]any)
+		if !ok {
+			continue
+		}
+		id, _ := m["id"].(string)
+		name, _ := m["name"].(string)
+		id = strings.TrimSpace(id)
+		name = strings.TrimSpace(name)
+		if id == "" || name == "" {
+			continue
+		}
+		lines = append(lines, fmt.Sprintf("- %s (%s)", name, id))
+	}
+	answer := strings.Join(lines, "\n")
+	if onToken != nil {
+		onToken(answer)
+	}
+	return models.ChatResponse{Answer: answer, Steps: steps}, true, nil
 }
 
 func (c *ChatService) getConversationState(conversationID string) *conversationState {
@@ -828,6 +4176,8 @@ func scoreDeviceNameMatch(query string, fields ...string) int {
 			s = 200
 		} else if strings.Contains(ff, q) {
 			s = 120
+		} else if strings.Contains(q, ff) && len(ff) >= 3 {
+			s = 100
 		} else {
 			qParts := strings.Fields(q)
 			match := 0
@@ -850,6 +4200,123 @@ func scoreDeviceNameMatch(query string, fields ...string) int {
 	return best
 }
 
+func parseRows(body []byte) []any {
+	var root map[string]any
+	if json.Unmarshal(body, &root) != nil {
+		return nil
+	}
+	if v, ok := root["data"]; ok {
+		if rows, ok := v.([]any); ok {
+			return rows
+		}
+		if mm, ok := v.(map[string]any); ok {
+			if rows, ok := mm["data"].([]any); ok {
+				return rows
+			}
+			if rows, ok := mm["items"].([]any); ok {
+				return rows
+			}
+		}
+	}
+	if rows, ok := root["items"].([]any); ok {
+		return rows
+	}
+	return nil
+}
+
+func (c *ChatService) resolveVenueIDFromName(ctx context.Context, conversationID string, name string) (int, *models.Step) {
+	if c.Gateway == nil {
+		return 0, nil
+	}
+
+	searchQuery := urlEscape(strings.TrimSpace(name))
+	// Try the new search endpoint first
+	searchPath := "/ads/venues/search?query=" + searchQuery + "&page=1&page_size=50"
+	status, body, err := c.Gateway.Get(searchPath)
+	step := &models.Step{Tool: "adsVenuesSearch", Status: status}
+	if err == nil && status >= 200 && status < 300 {
+		step.Body = clipString(strings.TrimSpace(string(body)), 2000)
+		rows := parseRows(body)
+		if len(rows) > 0 {
+			bestID := 0
+			bestScore := 0
+			for _, it := range rows {
+				m, ok := it.(map[string]any)
+				if !ok {
+					continue
+				}
+				vID := 0
+				switch v := m["id"].(type) {
+				case float64:
+					vID = int(v)
+				case int:
+					vID = v
+				}
+				vName, _ := m["name"].(string)
+				vDesc, _ := m["description"].(string)
+
+				score := scoreDeviceNameMatch(name, vName, vDesc)
+				if score > bestScore {
+					bestScore = score
+					bestID = vID
+				}
+			}
+			if bestScore >= 30 {
+				return bestID, step
+			}
+		}
+	}
+
+	// Fallback to listing all venues if search fails or finds nothing strong
+	path := "/ads/venues?page=1&page_size=200"
+	status, body, err = c.Gateway.Get(path)
+	step = &models.Step{Tool: "adsVenues", Status: status}
+	if err != nil {
+		step.Error = err.Error()
+		return 0, step
+	}
+	step.Body = clipString(strings.TrimSpace(string(body)), 2000)
+
+	if status < 200 || status >= 300 {
+		return 0, step
+	}
+
+	rows := parseRows(body)
+	if len(rows) == 0 {
+		return 0, step
+	}
+
+	bestID := 0
+	bestScore := 0
+	for _, it := range rows {
+		m, ok := it.(map[string]any)
+		if !ok {
+			continue
+		}
+		vID := 0
+		switch v := m["id"].(type) {
+		case float64:
+			vID = int(v)
+		case int:
+			vID = v
+		}
+		vName, _ := m["name"].(string)
+		vDesc, _ := m["description"].(string)
+
+		score := scoreDeviceNameMatch(name, vName, vDesc)
+		if score > bestScore {
+			bestScore = score
+			bestID = vID
+		}
+	}
+
+	if bestScore >= 30 {
+		return bestID, step
+	}
+
+	return 0, step
+}
+
 func (c *ChatService) resolveHostFromDeviceName(ctx context.Context, conversationID string, name string) (string, *models.Step) {
 	if c.Gateway == nil {
 		return "", nil
@@ -865,14 +4332,27 @@ func (c *ChatService) resolveHostFromDeviceName(ctx context.Context, conversatio
 	// Require a reasonably strong match so we don't accidentally resolve to an unrelated device.
 	queryNorm := normalizeLooseText(name)
 	queryTokens := make([]string, 0)
+	stop := map[string]struct{}{
+		"show": {}, "get": {}, "give": {}, "tell": {}, "please": {}, "me": {}, "the": {}, "a": {}, "an": {},
+		"device": {}, "devices": {}, "kiosk": {}, "kiosks": {}, "server": {}, "info": {}, "detail": {}, "details": {},
+		"status": {}, "health": {}, "metrics": {}, "telemetry": {},
+	}
 	for _, t := range strings.Fields(queryNorm) {
+		if _, ok := stop[t]; ok {
+			continue
+		}
 		if len(t) >= 4 {
 			queryTokens = append(queryTokens, t)
 		}
 	}
 	if len(queryTokens) == 0 {
 		// Fall back to old behavior (but still with a higher threshold).
-		queryTokens = strings.Fields(queryNorm)
+		for _, t := range strings.Fields(queryNorm) {
+			if _, ok := stop[t]; ok {
+				continue
+			}
+			queryTokens = append(queryTokens, t)
+		}
 	}
 	countTokenMatches := func(candidate string) int {
 		cand := normalizeLooseText(candidate)
@@ -897,7 +4377,7 @@ func (c *ChatService) resolveHostFromDeviceName(ctx context.Context, conversatio
 
 	// Prefer the search endpoint when available, but different deployments may use different param names.
 	searchQuery := urlEscape(strings.TrimSpace(name))
-	searchCandidates := []struct {
+	baseCandidates := []struct {
 		tool string
 		path string
 	}{
@@ -907,48 +4387,43 @@ func (c *ChatService) resolveHostFromDeviceName(ctx context.Context, conversatio
 		{tool: "adsDevices", path: "/ads/devices?query=" + searchQuery + "&page=1&page_size=200"},
 		{tool: "adsDevices", path: "/ads/devices?search=" + searchQuery + "&page=1&page_size=200"},
 	}
-	if city != "" {
-		for i := range searchCandidates {
-			searchCandidates[i].path += "&city=" + urlEscape(city)
+	makeCandidates := func(withCity bool) []struct{ tool, path string } {
+		out := make([]struct{ tool, path string }, 0, len(baseCandidates))
+		for _, cnd := range baseCandidates {
+			out = append(out, struct{ tool, path string }{tool: cnd.tool, path: cnd.path})
 		}
+		if withCity && city != "" {
+			for i := range out {
+				out[i].path += "&city=" + urlEscape(city)
+			}
+		}
+		return out
 	}
 
-	parseRows := func(body []byte) []any {
-		var root map[string]any
-		if json.Unmarshal(body, &root) != nil {
-			return nil
-		}
-		if rows, ok := root["data"].([]any); ok {
-			return rows
-		}
-		if rows, ok := root["items"].([]any); ok {
-			return rows
-		}
-		return nil
-	}
-
-	for _, cand := range searchCandidates {
-		status, body, err := c.Gateway.Get(cand.path)
-		searchStep := &models.Step{Tool: cand.tool, Status: status}
-		if err != nil {
-			searchStep.Error = err.Error()
+	// First try city-scoped search (more precise). If it yields no strong match, retry without city.
+	runCandidates := func(cands []struct{ tool, path string }) {
+		for _, cand := range cands {
+			status, body, err := c.Gateway.Get(cand.path)
+			searchStep := &models.Step{Tool: cand.tool, Status: status}
+			if err != nil {
+				searchStep.Error = err.Error()
+				bestStep = searchStep
+				continue
+			}
+			searchStep.Body = clipString(strings.TrimSpace(string(body)), 2000)
 			bestStep = searchStep
-			continue
-		}
-		searchStep.Body = clipString(strings.TrimSpace(string(body)), 2000)
-		bestStep = searchStep
-		if status == 400 {
-			// Likely wrong parameter name / endpoint shape; try the next candidate.
-			continue
-		}
-		if status < 200 || status >= 300 {
-			continue
-		}
-		rows := parseRows(body)
-		if len(rows) == 0 {
-			continue
-		}
-		for _, it := range rows {
+			if status == 400 {
+				// Likely wrong parameter name / endpoint shape; try the next candidate.
+				continue
+			}
+			if status < 200 || status >= 300 {
+				continue
+			}
+			rows := parseRows(body)
+			if len(rows) == 0 {
+				continue
+			}
+			for _, it := range rows {
 				m, ok := it.(map[string]any)
 				if !ok {
 					continue
@@ -958,13 +4433,51 @@ func (c *ChatService) resolveHostFromDeviceName(ctx context.Context, conversatio
 				if region != "" && strings.ToLower(strings.TrimSpace(rowRegion)) != region {
 					continue
 				}
+				description, _ := m["description"].(string)
+				displayName, _ := m["display_name"].(string)
+				if strings.TrimSpace(displayName) == "" {
+					displayName, _ = m["displayName"].(string)
+				}
 				kioskName, _ := m["kiosk_name"].(string)
 				if strings.TrimSpace(kioskName) == "" {
 					kioskName, _ = m["kioskName"].(string)
 				}
 				deviceName, _ := m["name"].(string)
+				facing := ""
+				stopName := ""
+				if dc, ok := m["device_config"].(map[string]any); ok {
+					facing, _ = dc["facing"].(string)
+					if stops, ok := dc["stops"].([]any); ok && len(stops) > 0 {
+						if sm, ok := stops[0].(map[string]any); ok {
+							stopName, _ = sm["stop_name"].(string)
+							if strings.TrimSpace(stopName) == "" {
+								stopName, _ = sm["stopName"].(string)
+							}
+						}
+					}
+					if gtfs, ok := dc["gtfs"].(map[string]any); ok {
+						if strings.TrimSpace(stopName) == "" {
+							stopName, _ = gtfs["stopName"].(string)
+						}
+					}
+				}
 				hostName, _ := m["host_name"].(string)
+				if strings.TrimSpace(hostName) == "" {
+					hostName, _ = m["host"].(string)
+				}
+				if strings.TrimSpace(hostName) == "" {
+					hostName, _ = m["hostName"].(string)
+				}
 				serverID, _ := m["server_id"].(string)
+				if strings.TrimSpace(serverID) == "" {
+					serverID, _ = m["serverId"].(string)
+				}
+				if strings.TrimSpace(serverID) == "" {
+					serverID, _ = m["device_key"].(string)
+				}
+				if strings.TrimSpace(serverID) == "" {
+					serverID, _ = m["deviceKey"].(string)
+				}
 				candidateHost := strings.TrimSpace(serverID)
 				if candidateHost == "" {
 					candidateHost = strings.TrimSpace(hostName)
@@ -972,19 +4485,26 @@ func (c *ChatService) resolveHostFromDeviceName(ctx context.Context, conversatio
 				if candidateHost == "" {
 					continue
 				}
-				nameHits := countTokenMatches(kioskName) + countTokenMatches(deviceName)
+				nameHits := countTokenMatches(kioskName) + countTokenMatches(deviceName) + countTokenMatches(displayName) + countTokenMatches(description) + countTokenMatches(stopName) + countTokenMatches(facing)
 				if nameHits < 2 {
 					continue
 				}
-				score := scoreDeviceNameMatch(name, kioskName, deviceName, hostName, serverID, rowCity, rowRegion)
+				score := scoreDeviceNameMatch(name, kioskName, deviceName, displayName, description, stopName, facing, hostName, serverID, rowCity, rowRegion)
 				if score > bestScore {
 					bestScore = score
 					bestHost = candidateHost
 				}
 			}
-		if bestScore >= 60 {
-			return strings.ToLower(strings.TrimSpace(bestHost)), bestStep
 		}
+	}
+
+	// First try city-scoped search (more precise). If it yields no strong match, retry without city.
+	runCandidates(makeCandidates(true))
+	if bestScore < 30 {
+		runCandidates(makeCandidates(false))
+	}
+	if bestScore >= 30 {
+		return strings.ToLower(strings.TrimSpace(bestHost)), bestStep
 	}
 
 	page := 1
@@ -1020,6 +4540,12 @@ func (c *ChatService) resolveHostFromDeviceName(ctx context.Context, conversatio
 				hasMore = v
 			}
 		}
+		// Some deployments don't include pagination.has_more; fall back to row count.
+		if !hasMore {
+			if len(rows) == pageSize {
+				hasMore = true
+			}
+		}
 
 		for _, it := range rows {
 			m, ok := it.(map[string]any)
@@ -1032,14 +4558,52 @@ func (c *ChatService) resolveHostFromDeviceName(ctx context.Context, conversatio
 			if region != "" && strings.ToLower(strings.TrimSpace(rowRegion)) != region {
 				continue
 			}
+			description, _ := m["description"].(string)
+			displayName, _ := m["display_name"].(string)
+			if strings.TrimSpace(displayName) == "" {
+				displayName, _ = m["displayName"].(string)
+			}
 
 			kioskName, _ := m["kiosk_name"].(string)
 			if strings.TrimSpace(kioskName) == "" {
 				kioskName, _ = m["kioskName"].(string)
 			}
 			deviceName, _ := m["name"].(string)
+			facing := ""
+			stopName := ""
+			if dc, ok := m["device_config"].(map[string]any); ok {
+				facing, _ = dc["facing"].(string)
+				if stops, ok := dc["stops"].([]any); ok && len(stops) > 0 {
+					if sm, ok := stops[0].(map[string]any); ok {
+						stopName, _ = sm["stop_name"].(string)
+						if strings.TrimSpace(stopName) == "" {
+							stopName, _ = sm["stopName"].(string)
+						}
+					}
+				}
+				if gtfs, ok := dc["gtfs"].(map[string]any); ok {
+					if strings.TrimSpace(stopName) == "" {
+						stopName, _ = gtfs["stopName"].(string)
+					}
+				}
+			}
 			hostName, _ := m["host_name"].(string)
+			if strings.TrimSpace(hostName) == "" {
+				hostName, _ = m["host"].(string)
+			}
+			if strings.TrimSpace(hostName) == "" {
+				hostName, _ = m["hostName"].(string)
+			}
 			serverID, _ := m["server_id"].(string)
+			if strings.TrimSpace(serverID) == "" {
+				serverID, _ = m["serverId"].(string)
+			}
+			if strings.TrimSpace(serverID) == "" {
+				serverID, _ = m["device_key"].(string)
+			}
+			if strings.TrimSpace(serverID) == "" {
+				serverID, _ = m["deviceKey"].(string)
+			}
 
 			// Choose the best candidate identifier to use as server_id for metrics.
 			candidateHost := strings.TrimSpace(serverID)
@@ -1051,12 +4615,12 @@ func (c *ChatService) resolveHostFromDeviceName(ctx context.Context, conversatio
 			}
 
 			// Require multiple token hits on the human-readable name to avoid random matches.
-			nameHits := countTokenMatches(kioskName) + countTokenMatches(deviceName)
+			nameHits := countTokenMatches(kioskName) + countTokenMatches(deviceName) + countTokenMatches(displayName) + countTokenMatches(description) + countTokenMatches(stopName) + countTokenMatches(facing)
 			if nameHits < 2 {
 				continue
 			}
 
-			score := scoreDeviceNameMatch(name, kioskName, deviceName, hostName, serverID, rowCity, rowRegion)
+			score := scoreDeviceNameMatch(name, kioskName, deviceName, displayName, description, stopName, facing, hostName, serverID, rowCity, rowRegion)
 			if score > bestScore {
 				bestScore = score
 				bestHost = candidateHost
@@ -1075,7 +4639,7 @@ func (c *ChatService) resolveHostFromDeviceName(ctx context.Context, conversatio
 			break
 		}
 	}
-	if bestScore < 60 {
+	if bestScore < 30 {
 		return "", bestStep
 	}
 	return strings.ToLower(strings.TrimSpace(bestHost)), bestStep
@@ -1836,11 +5400,13 @@ func extractTopN(msgLower string) int {
 
 func (c *ChatService) handlePopStatsGeneric(ctx context.Context, req models.ChatRequest, onToken func(string)) (models.ChatResponse, bool, error) {
 	msgLower := strings.ToLower(req.Message)
-	if !(strings.Contains(msgLower, "stat") || strings.Contains(msgLower, "pop")) {
+	if !(strings.Contains(msgLower, "stat") || strings.Contains(msgLower, "pop") || strings.Contains(msgLower, "analytic")) {
 		return models.ChatResponse{}, false, nil
 	}
 
-	if strings.Contains(msgLower, "top poster") || strings.Contains(msgLower, "top device") || strings.Contains(msgLower, "top kiosk") {
+	// When the user asks for "top X" analytics, allow this generic stats handler to answer.
+	// Specific top-* handlers run earlier and will still take precedence.
+	if !strings.Contains(msgLower, "analytic") && (strings.Contains(msgLower, "top poster") || strings.Contains(msgLower, "top device") || strings.Contains(msgLower, "top kiosk")) {
 		// Covered by specific handlers that run earlier.
 		return models.ChatResponse{}, false, nil
 	}
@@ -1848,15 +5414,12 @@ func (c *ChatService) handlePopStatsGeneric(ctx context.Context, req models.Chat
 	conversationID := strings.TrimSpace(req.ConversationID)
 	city := c.detectCityCode(ctx, msgLower)
 	region := c.detectRegionCode(ctx, msgLower)
-	// Reuse last city/region for follow-ups like "show pop stats".
+	// If the user explicitly mentioned a city or region in the message, prioritize that.
+	// Otherwise, fallback to the conversation state.
 	if city == "" && region == "" && conversationID != "" {
 		if st := c.getConversationState(conversationID); st != nil {
-			if strings.TrimSpace(st.City) != "" {
-				city = strings.ToLower(strings.TrimSpace(st.City))
-			}
-			if strings.TrimSpace(st.Region) != "" {
-				region = strings.ToLower(strings.TrimSpace(st.Region))
-			}
+			city = strings.ToLower(strings.TrimSpace(st.City))
+			region = strings.ToLower(strings.TrimSpace(st.Region))
 		}
 	}
 	if city == "" && region == "" {
@@ -1995,6 +5558,13 @@ func (c *ChatService) handleDeviceTelemetry(ctx context.Context, req models.Chat
 			}
 		}
 		return false
+	}
+	// Avoid misrouting analytics/POP/stats queries to telemetry just because they mention "kiosk" or "device".
+	// Telemetry intent should be explicit (telemetry/health/status/metrics).
+	if strings.Contains(msgLower, "analytic") || strings.Contains(msgLower, "pop") || strings.Contains(msgLower, "stats") {
+		if !(contains("telemetry", "health", "device status", "metrics", "temperature", "battery", "uptime", "disk", "storage", "cpu", "ram", "volume", "mute", "network", "bandwidth", "data usage")) {
+			return models.ChatResponse{}, false, nil
+		}
 	}
 
 	wantsTemp := contains("temp", "temperature", "heat")
@@ -2350,14 +5920,24 @@ func (c *ChatService) detectRegionCode(ctx context.Context, msgLower string) str
 			if i+1 < len(words) {
 				cand := strings.ToLower(strings.TrimSpace(words[i+1]))
 				if cand != "" && c.isKnownRegionCode(ctx, cand) {
+					// If the user also mentioned "city" and this token looks like a city code,
+					// do not treat it as a region.
+					if strings.Contains(s, "city") && c.isKnownProjectCityCode(ctx, cand) {
+						// continue searching; this is likely the city token (e.g. "moco city")
+					} else {
 					return cand
+					}
 				}
 			}
 			// <code> region
 			if i-1 >= 0 {
 				cand := strings.ToLower(strings.TrimSpace(words[i-1]))
 				if cand != "" && c.isKnownRegionCode(ctx, cand) {
+					if strings.Contains(s, "city") && c.isKnownProjectCityCode(ctx, cand) {
+						// continue searching
+					} else {
 					return cand
+					}
 				}
 			}
 		}
@@ -2637,6 +6217,321 @@ func detectHostTokens(msg string) []string {
 		out = append(out, strings.TrimSpace(token))
 	}
 	return out
+}
+
+func (c *ChatService) buildInterpretationHeader(req models.ChatRequest, conversationID string) string {
+	msg := strings.TrimSpace(req.Message)
+	if msg == "" {
+		return ""
+	}
+	msgLower := strings.ToLower(msg)
+
+	var st *conversationState
+	if strings.TrimSpace(conversationID) != "" {
+		st = c.getConversationState(strings.TrimSpace(conversationID))
+	}
+
+	isPopDomain := strings.Contains(msgLower, "pop") || strings.Contains(msgLower, "stat") || strings.Contains(msgLower, "analytic")
+	isDeviceHealth := strings.Contains(msgLower, "telemetry") || strings.Contains(msgLower, "health") || strings.Contains(msgLower, "metrics") || strings.Contains(msgLower, "cpu") || strings.Contains(msgLower, "ram") || strings.Contains(msgLower, "memory") || strings.Contains(msgLower, "disk") || strings.Contains(msgLower, "storage") || strings.Contains(msgLower, "uptime") || strings.Contains(msgLower, "battery") || strings.Contains(msgLower, "network") || strings.Contains(msgLower, "bandwidth") || strings.Contains(msgLower, "data usage") || strings.Contains(msgLower, "volume") || strings.Contains(msgLower, "mute")
+
+	// Time window
+	timeWindow := ""
+	if strings.Contains(msgLower, "yesterday") || strings.Contains(msgLower, "yesterday's") || strings.Contains(msgLower, "yesterdays") {
+		timeWindow = "Yesterday"
+	} else if strings.Contains(msgLower, "today") || strings.Contains(msgLower, "today's") || strings.Contains(msgLower, "todays") || strings.Contains(msgLower, "current_day") {
+		timeWindow = "Today"
+	} else if strings.Contains(msgLower, "month") {
+		timeWindow = "Monthly"
+	} else if strings.Contains(msgLower, "since") {
+		timeWindow = "Since"
+	}
+
+	// Unit
+	unit := ""
+	if strings.Contains(msgLower, "minute") {
+		unit = "in minutes"
+	}
+
+	// Scope/entity
+	subject := ""
+	if isDeviceHealth {
+		subject = "Device health"
+	} else if strings.Contains(msgLower, "device") || strings.Contains(msgLower, "kiosk") || strings.Contains(msgLower, "server") {
+		if strings.Contains(msgLower, "detail") || strings.Contains(msgLower, "info") || strings.Contains(msgLower, "show") || strings.Contains(msgLower, "get") {
+			subject = "Device info"
+		}
+	} else if strings.Contains(msgLower, "venue") {
+		if strings.Contains(msgLower, "device") || strings.Contains(msgLower, "devices") {
+			subject = "Venue devices"
+		} else {
+			subject = "Venue"
+		}
+	} else if strings.Contains(msgLower, "poster") || strings.Contains(msgLower, "creative") || strings.Contains(msgLower, "ad") {
+		if isPopDomain {
+			subject = "Poster POP"
+		} else if strings.Contains(msgLower, "play") || strings.Contains(msgLower, "count") {
+			subject = "Poster play count"
+		} else {
+			subject = "Poster"
+		}
+	} else if isPopDomain {
+		subject = "POP"
+	}
+	if subject == "" && st != nil {
+		if strings.Contains(msgLower, "same") {
+			if strings.TrimSpace(st.PosterID) != "" || strings.TrimSpace(st.PosterName) != "" {
+				subject = "Poster play count"
+			}
+		}
+	}
+
+	// Grouping/shape
+	shape := ""
+	if strings.Contains(msgLower, "kiosk wise") || strings.Contains(msgLower, "kiosk-wise") || strings.Contains(msgLower, "kiosks wise") || strings.Contains(msgLower, "kiosks-wise") {
+		shape = "kiosk-wise"
+	} else if strings.Contains(msgLower, "top") && (strings.Contains(msgLower, "kiosk") || strings.Contains(msgLower, "kiosks")) {
+		shape = "top kiosks"
+	} else if strings.Contains(msgLower, "top") && (strings.Contains(msgLower, "device") || strings.Contains(msgLower, "devices")) {
+		shape = "top devices"
+	} else if strings.Contains(msgLower, "top") && (strings.Contains(msgLower, "poster") || strings.Contains(msgLower, "posters")) {
+		shape = "top posters"
+	} else if strings.Contains(msgLower, "top") {
+		shape = "top"
+	}
+
+	// Geo scope (best-effort)
+	scope := ""
+	getPrevToken := func(tokens []string, idx int) string {
+		if idx <= 0 || idx >= len(tokens) {
+			return ""
+		}
+		cand := strings.TrimSpace(tokens[idx-1])
+		cand = strings.Trim(cand, "\"'.,;:()[]{}")
+		candLower := strings.ToLower(cand)
+		switch candLower {
+		case "from", "in", "the", "a", "an", "of", "for", "on", "at", "to", "with":
+			return ""
+		}
+		return cand
+	}
+	getNextToken := func(tokens []string, idx int) string {
+		if idx < 0 || idx+1 >= len(tokens) {
+			return ""
+		}
+		cand := strings.TrimSpace(tokens[idx+1])
+		cand = strings.Trim(cand, "\"'.,;:()[]{}")
+		candLower := strings.ToLower(cand)
+		switch candLower {
+		case "from", "in", "the", "a", "an", "of", "for", "on", "at", "to", "with":
+			return ""
+		}
+		return cand
+	}
+	words := strings.Fields(msgLower)
+	region := ""
+	city := ""
+	for i, w := range words {
+		wl := strings.ToLower(strings.Trim(w, "\"'.,;:()[]{}"))
+		if region == "" && wl == "region" {
+			region = getPrevToken(words, i)
+			if region == "" {
+				region = getNextToken(words, i)
+			}
+		}
+		if city == "" && wl == "city" {
+			city = getPrevToken(words, i)
+			if city == "" {
+				city = getNextToken(words, i)
+			}
+		}
+	}
+	if region == "" {
+		region2 := strings.TrimSpace(extractAfterKeyword(msgLower, "region"))
+		if region2 != "" {
+			if f := strings.Fields(region2); len(f) > 0 {
+				region = strings.Trim(f[0], "\"'.,;:()[]{}")
+			}
+		}
+	}
+	if city == "" {
+		city2 := strings.TrimSpace(extractAfterKeyword(msgLower, "city"))
+		if city2 != "" {
+			if f := strings.Fields(city2); len(f) > 0 {
+				city = strings.Trim(f[0], "\"'.,;:()[]{}")
+			}
+		}
+	}
+	if region != "" {
+		scope = "region=" + region
+	}
+	if city != "" {
+		if scope != "" {
+			scope += ","
+		}
+		scope += "city=" + city
+	}
+	if scope == "" && st != nil {
+		memRegion := strings.ToLower(strings.TrimSpace(st.Region))
+		memCity := strings.ToLower(strings.TrimSpace(st.City))
+		if memRegion != "" {
+			scope = "region=" + memRegion
+		}
+		if memCity != "" {
+			if scope != "" {
+				scope += ","
+			}
+			scope += "city=" + memCity
+		}
+	}
+
+	// Target (host token if present)
+	target := ""
+	userProvidedHost := false
+	isLikelyHost := func(s string) bool {
+		cand := strings.ToLower(strings.TrimSpace(s))
+		cand = strings.ReplaceAll(cand, "_", "-")
+		if cand == "" {
+			return false
+		}
+		parts := strings.Split(cand, "-")
+		good := 0
+		for _, p := range parts {
+			if strings.TrimSpace(p) != "" {
+				good++
+			}
+		}
+		return good >= 3
+	}
+	if tokens := detectHostTokens(msg); len(tokens) > 0 {
+		cand := strings.ToLower(strings.TrimSpace(tokens[0]))
+		if isLikelyHost(cand) {
+			target = cand
+			userProvidedHost = true
+		}
+	}
+	if target == "" && st != nil {
+		// Only show a remembered host when it's clearly relevant (device/host-oriented queries).
+		// For poster-specific POP/play-count flows (including kiosk-wise follow-ups), avoid implying a host target.
+		if strings.TrimSpace(st.Host) != "" {
+			if isDeviceHealth {
+				target = strings.ToLower(strings.TrimSpace(st.Host))
+			} else if subject == "Device info" {
+				target = strings.ToLower(strings.TrimSpace(st.Host))
+			} else if subject != "" && strings.Contains(strings.ToLower(subject), "poster") {
+				// no-op
+			} else if strings.Contains(msgLower, "poster") || strings.Contains(msgLower, "creative") || strings.Contains(msgLower, "ad") {
+				// no-op
+			} else if userProvidedHost {
+				target = strings.ToLower(strings.TrimSpace(st.Host))
+			} else {
+				// POP-by-host / device details / similar follow-ups can reuse host.
+				if strings.Contains(msgLower, "pop") || strings.Contains(msgLower, "device") || strings.Contains(msgLower, "kiosk") || strings.Contains(msgLower, "server") {
+					target = strings.ToLower(strings.TrimSpace(st.Host))
+				}
+			}
+		}
+	}
+
+	posterRef := ""
+	if st != nil && subject != "Device info" && !isDeviceHealth {
+		if strings.TrimSpace(st.PosterID) != "" {
+			posterRef = strings.TrimSpace(st.PosterID)
+		} else if strings.TrimSpace(st.PosterName) != "" {
+			posterRef = strings.TrimSpace(st.PosterName)
+		}
+	}
+	if p := extractAfterKeyword(msgLower, "poster"); strings.TrimSpace(p) != "" {
+		p = strings.TrimSpace(p)
+		if f := strings.Fields(p); len(f) > 0 {
+			if looksLikeUUID(f[0]) {
+				posterRef = f[0]
+			} else if strings.TrimSpace(posterRef) == "" {
+				posterRef = p
+			}
+		}
+	}
+	for _, tk := range strings.Fields(msgLower) {
+		if looksLikeUUID(tk) {
+			posterRef = tk
+			break
+		}
+	}
+	if strings.TrimSpace(posterRef) != "" {
+		posterRef = clipString(strings.TrimSpace(posterRef), 60)
+	}
+	// If we have poster context and the user is asking for kiosk-wise breakdown, avoid implying a host target
+	// unless the user explicitly provided a host token.
+	if !userProvidedHost && !isDeviceHealth && strings.TrimSpace(posterRef) != "" && shape == "kiosk-wise" {
+		target = ""
+	}
+
+	venueRef := ""
+	venueID := 0
+	if st != nil && st.VenueID > 0 {
+		venueID = st.VenueID
+	}
+	if strings.Contains(msgLower, "venue") {
+		v := strings.TrimSpace(extractAfterKeyword(msgLower, "venue"))
+		if v != "" {
+			if f := strings.Fields(v); len(f) > 0 {
+				if id, err := strconv.Atoi(strings.TrimSpace(f[0])); err == nil {
+					venueID = id
+				} else {
+					venueRef = v
+				}
+			}
+		}
+	}
+	if venueRef != "" {
+		venueRef = clipString(strings.TrimSpace(venueRef), 60)
+	}
+
+	parts := make([]string, 0, 6)
+	if timeWindow != "" {
+		parts = append(parts, timeWindow)
+	}
+	if subject != "" {
+		parts = append(parts, subject)
+	}
+	if posterRef != "" {
+		parts = append(parts, "poster="+posterRef)
+	}
+	if venueID > 0 {
+		parts = append(parts, fmt.Sprintf("venue_id=%d", venueID))
+	} else if venueRef != "" {
+		parts = append(parts, "venue="+venueRef)
+	}
+	if target != "" {
+		parts = append(parts, "for "+target)
+	}
+	if shape != "" {
+		parts = append(parts, "("+shape+")")
+	}
+	if scope != "" {
+		parts = append(parts, "["+scope+"]")
+	}
+	if unit != "" {
+		parts = append(parts, unit)
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return "Interpreted request: " + strings.Join(parts, " ")
+}
+
+func prefixIfNeeded(header, answer string) string {
+	h := strings.TrimSpace(header)
+	a := strings.TrimSpace(answer)
+	if h == "" {
+		return answer
+	}
+	if a == "" {
+		return header
+	}
+	if strings.HasPrefix(a, h) {
+		return answer
+	}
+	return h + "\n" + answer
 }
 
 func isCreativeUploadIntent(msgLower string) bool {
@@ -3228,19 +7123,29 @@ func extractAfterKeyword(msgLower, keyword string) string {
 	if idx < 0 {
 		return ""
 	}
-	rest := strings.TrimSpace(msgLower[idx+len(keyword):])
-	if rest == "" {
+	rest := msgLower[idx+len(keyword):]
+	return strings.TrimSpace(rest)
+}
+
+func extractAfterKeywordOriginal(msg string, keyword string) string {
+	msgTrim := strings.TrimSpace(msg)
+	if msgTrim == "" {
 		return ""
 	}
-	stop := len(rest)
-	for _, sep := range []string{"\n", ",", ";", " with ", " where ", " from ", " status ", " active", " scheduled", " paused", " selected", " day", " days", " time", " slot", " slots", " device", " devices"} {
-		if j := strings.Index(rest, sep); j >= 0 && j < stop {
-			stop = j
-		}
+	key := strings.ToLower(strings.TrimSpace(keyword))
+	if key == "" {
+		return ""
 	}
-	name := strings.TrimSpace(rest[:stop])
-	name = strings.Trim(name, "\"' ")
-	return name
+	low := strings.ToLower(msgTrim)
+	idx := strings.Index(low, key)
+	if idx < 0 {
+		return ""
+	}
+	start := idx + len(key)
+	if start < 0 || start > len(msgTrim) {
+		return ""
+	}
+	return strings.TrimSpace(msgTrim[start:])
 }
 
 func urlEscape(s string) string {
@@ -3972,291 +7877,26 @@ func (c *ChatService) buildHistory(ctx context.Context, ownerKey, conversationID
 }
 
 func (c *ChatService) Chat(ctx context.Context, ownerKey string, req models.ChatRequest) (models.ChatResponse, error) {
-	conversationID := strings.TrimSpace(req.ConversationID)
-	if conversationID != "" {
-		c.ensureConversationStateHydrated(ctx, ownerKey, conversationID)
-		_ = c.Store.AppendMessage(ctx, ownerKey, conversationID, "user", req.Message)
-	}
-	if conversationID != "" {
-		st := c.getConversationState(conversationID)
-		if st != nil && st.PendingHandler == "deviceTelemetry" {
-			hostTokens := detectHostTokens(req.Message)
-			// If the user's reply looks like a kiosk/device display name (spaces) or a generic token like "kiosk-1",
-			// prefer resolving it to a real host via /ads/devices.
-			shouldResolve := false
-			if len(hostTokens) == 0 {
-				shouldResolve = true
-			} else {
-				msgHasSpaces := strings.Contains(strings.TrimSpace(req.Message), " ")
-				candidate := strings.ToLower(strings.TrimSpace(hostTokens[0]))
-				// A typical SCM host is like city-region-... (>=3 dash segments). Tokens like kiosk-1 are ambiguous.
-				parts := strings.Split(strings.ReplaceAll(candidate, "_", "-"), "-")
-				if msgHasSpaces || len(parts) < 3 {
-					shouldResolve = true
-				}
-			}
-			if shouldResolve {
-				if host, step := c.resolveHostFromDeviceName(ctx, conversationID, req.Message); strings.TrimSpace(host) != "" {
-					msg := strings.TrimSpace(st.PendingMessage)
-					if msg == "" {
-						msg = "show telemetry"
-					}
-					c.clearPending(conversationID)
-					req2 := req
-					req2.Message = msg + " " + host
-					resp, handled, err := c.handleDeviceTelemetry(ctx, req2, nil)
-					if handled {
-						if step != nil {
-							resp.Steps = append([]models.Step{*step}, resp.Steps...)
-						}
-						return resp, err
-					}
-				}
-				c.clearPending(conversationID)
-				return models.ChatResponse{Answer: "I couldn't find a device matching that name. Please reply with the host/server id (for example: moco-brt-briggs-001)."}, nil
-			}
-		}
-	}
-
-	if resp, handled, err := c.handleTopPostersFromCity(ctx, req, nil); handled {
-		if conversationID != "" {
-			_ = c.Store.AppendMessage(ctx, ownerKey, conversationID, "assistant", resp.Answer)
-		}
-		return resp, err
-	}
-	if resp, handled, err := c.handleTopDevicesFromCity(ctx, req, nil); handled {
-		if conversationID != "" {
-			_ = c.Store.AppendMessage(ctx, ownerKey, conversationID, "assistant", resp.Answer)
-		}
-		return resp, err
-	}
-	if resp, handled, err := c.handleKioskCountFromCity(ctx, req, nil); handled {
-		if conversationID != "" {
-			_ = c.Store.AppendMessage(ctx, ownerKey, conversationID, "assistant", resp.Answer)
-		}
-		return resp, err
-	}
-	if resp, handled, err := c.handlePopTodayByHost(ctx, req, nil); handled {
-		if conversationID != "" {
-			_ = c.Store.AppendMessage(ctx, ownerKey, conversationID, "assistant", resp.Answer)
-		}
-		return resp, err
-	}
-	if resp, handled, err := c.handleMetricsTodayByLocation(ctx, req, nil); handled {
-		if conversationID != "" {
-			_ = c.Store.AppendMessage(ctx, ownerKey, conversationID, "assistant", resp.Answer)
-		}
-		return resp, err
-	}
-	if resp, handled, err := c.handleDeviceTelemetry(ctx, req, nil); handled {
-		if conversationID != "" {
-			_ = c.Store.AppendMessage(ctx, ownerKey, conversationID, "assistant", resp.Answer)
-		}
-		return resp, err
-	}
-	if resp, handled, err := c.handleCreativeUpload(ctx, ownerKey, req); handled {
-		if conversationID != "" {
-			_ = c.Store.AppendMessage(ctx, ownerKey, conversationID, "assistant", resp.Answer)
-		}
-		return resp, err
-	}
-	if resp, handled, err := c.handlePosterDetails(ctx, req, nil); handled {
-		if conversationID != "" {
-			_ = c.Store.AppendMessage(ctx, ownerKey, conversationID, "assistant", resp.Answer)
-		}
-		return resp, err
-	}
-
-	
-	// Check for specific stat requests that need special handling
-	var isStatsRequest bool
-	var cityCode string
-	msgLower := strings.ToLower(req.Message)
-	if strings.Contains(msgLower, "stats") || strings.Contains(msgLower, "top") {
-		cityCode = c.detectCityCode(ctx, msgLower)
-		if cityCode != "" {
-			isStatsRequest = true
-		}
-		
-		if strings.Contains(msgLower, "top") {
-			isStatsRequest = true
-		}
-	}
-	
-	data, steps, toolData := c.prefetchImpressions(ctx, req.Message)
-
-	if c.MockMode {
-		answer := "(mock) I am running without OpenAI."
-		if toolData != nil {
-			b, _ := json.MarshalIndent(toolData, "", "  ")
-			answer = answer + "\n\nFetched data:\n" + string(b)
-		} else {
-			answer = answer + "\n\nTip: include a campaign id and ask for impressions to see real data."
-		}
-		if conversationID != "" {
-			_ = c.Store.AppendMessage(ctx, ownerKey, conversationID, "assistant", answer)
-		}
-		return models.ChatResponse{Answer: answer, Data: data, Steps: steps}, nil
-	}
-
-	system := `You are SmartCity Media dashboard assistant. Answer concisely and ALWAYS call the scm_request tool when retrieving data.
-
-You can access SCM Tool Gateway endpoints (OpenAPI): /ads/* (advertisers, campaigns, creatives, devices, venues, projects), /pop (list/search/stats/trend/impressions), /metrics (latest/history), and /context.
-Use pagination by default for list endpoints (page=1, page_size=20 unless user asks for more). For POP stats use limit=10 by default.
-
-Endpoint mapping for data requests:
-
-1. DASHBOARD DATA
-- Advertisers: GET /ads/advertisers
-- Campaigns: GET /ads/campaigns
-  With filter: GET /ads/campaigns?advertiser_id=<id>
-- Creatives: GET /ads/creatives
-  For campaign: GET /ads/creatives/campaign/<campaign_id>
-- Projects: GET /ads/projects
-  Specific: GET /ads/projects/{name}
-
-2. POP DATA
-- POP list: GET /pop (supports multiple query parameters)
-  For city: GET /pop?city=<city_code>&page=1&page_size=1
-  Example: GET /pop?city=brt&page=1&page_size=1
-- POP search: GET /pop/search?q=<search_term>
-- POP statistics: 
-  * City stats: GET /pop/stats?group_by=poster&city=brt&metric=clicks&limit=10
-  * Top posters by clicks: GET /pop/stats?group_by=poster&metric=clicks&order=top&limit=10
-  * Top devices by plays: GET /pop/stats?group_by=device&metric=plays&order=top&limit=10
-  * Top kiosks by count: GET /pop/stats?group_by=kiosk&metric=count&order=top&limit=10
-  * Bottom performers: Use order=bottom instead of top
-  * Filter by city: Add &city=<city_code>
-- POP trends: GET /pop/trend?dimension=<poster|device|city>&key=<value>&metric=<plays|clicks|count>
-
-3. DEVICES & VENUES
-- Devices count by region: GET /ads/devices/counts/regions
-  For specific city: GET /ads/devices/counts/regions?city=<city_code>
-- Device list: GET /ads/devices (supports pagination, filters)
-  By host: GET /ads/devices/{hostName}
-- Venues: GET /ads/venues
-  By ID: GET /ads/venues/{id}
-  Venue devices: GET /ads/venues/{id}/devices
-
-4. CREATIVE UPLOADS
-- Upload by URL: POST /ads/creatives/uploadByUrl
-  Body: {"campaign_id":"...","selected_days":"...","time_slots":"...","file_url":"..."}
-- Upload multiple: POST /ads/creatives/uploadByUrls
-  Body: {"campaign_id":"...","selected_days":"...","time_slots":"...","file_urls":["..."]}
-
-5. METRICS & SERVERS
-- Server inventory: GET /metrics/servers
-- Server status overall: GET /metrics/servers/status
-- Server status by city: GET /metrics/servers/status/city?city=<optional>
-- Latest metrics snapshot: GET /metrics/latest
-- Metrics history: GET /metrics/history
-
-6. CONTEXT MEMORY
-- Get: GET /context/{key}
-- Set: PUT /context/{key} with body {"value": any}
-
-ALWAYS use these exact paths - do not guess or make up paths.
-Poster IDs returned from POP stats (e.g., values starting with "vistar_") are NOT campaign IDs; look them up via GET /ads/creatives/search?query=<poster_id>.
-Always use city_code (like "kcmo") or region (like "brt") in query params when asking about specific areas.`
-	userContent := req.Message
-	if toolData != nil {
-		b, _ := json.Marshal(toolData)
-		userContent = userContent + "\n\nContext JSON (from internal APIs):\n" + clipString(string(b), 8000)
-	}
-
-	all := make([]OpenAIMessage, 0)
-	all = append(all, OpenAIMessage{Role: "system", Content: system})
-	all = append(all, c.buildHistory(ctx, ownerKey, conversationID)...)
-	all = append(all, OpenAIMessage{Role: "user", Content: userContent})
-
-	if c.MaxToolCalls <= 0 {
-		c.MaxToolCalls = 6
-	}
-	if c.MaxToolBytes <= 0 {
-		c.MaxToolBytes = 1_000_000
-	}
-
-	tools := []OpenAITool{
-		{
-			Type: "function",
-			Function: OpenAIToolFunction{
-				Name:        "scm_request",
-				Description: "Call an SCM Tool Gateway OpenAPI endpoint by method and path.",
-				Parameters: map[string]any{
-					"type": "object",
-					"properties": map[string]any{
-						"method": map[string]any{"type": "string"},
-						"path": map[string]any{"type": "string"},
-						"query": map[string]any{"type": "object", "additionalProperties": map[string]any{"type": "string"}},
-						"body": map[string]any{"type": "object"},
-						"multipart": map[string]any{
-							"type": "object",
-							"properties": map[string]any{
-								"fields": map[string]any{
-									"type": "object",
-									"additionalProperties": map[string]any{
-										"type": "array",
-										"items": map[string]any{"type": "string"},
-									},
-								},
-								"files": map[string]any{
-									"type": "array",
-									"items": map[string]any{
-										"type": "object",
-										"properties": map[string]any{
-											"field_name": map[string]any{"type": "string"},
-											"file_name": map[string]any{"type": "string"},
-											"content_type": map[string]any{"type": "string"},
-											"base64": map[string]any{"type": "string"},
-										},
-										"required": []any{"base64"},
-									},
-								},
-							},
-						},
-					},
-					"required": []any{"method", "path"},
-				},
-			},
-		},
-	}
-
-	// Always force tool usage to ensure consistent behavior like ChatGPT does
-	toolChoice := "required"
-	// First get the answer from the model
-	answer, err := c.chatWithToolLoop(ctx, all, tools, toolChoice)
-	if err != nil {
-		return models.ChatResponse{}, err
-	}
-	
-	// Check if we got empty data and should override the answer
-	if isStatsRequest {
-		// Check if we have empty data in the toolData
-		if toolData != nil {
-			if emptyData, ok := toolData["empty_data"].(map[string]any); ok && emptyData["found"] == true {
-				// Override the answer
-				emptyMsg, _ := emptyData["message"].(string)
-				if emptyMsg != "" {
-					if cityCode != "" {
-						answer = fmt.Sprintf("There are currently no statistics available for city '%s'. "+
-							"This means the database returned an empty result set, not that you lack permission to access this data.", cityCode)
-					} else {
-						answer = "The statistics you requested returned no data. This means the database returned an empty result set, not that you lack permission to access this data."
-					}
-				}
-			}
-		}
-	}
-	
-	if conversationID != "" {
-		_ = c.Store.AppendMessage(ctx, ownerKey, conversationID, "assistant", answer)
-	}
-
-	return models.ChatResponse{Answer: answer, Data: data, Steps: steps}, nil
+	// Keep a single source of truth for routing/tool-calling: ChatStream.
+	// ChatStream will handle conversation hydration + message persistence.
+	return c.ChatStream(ctx, ownerKey, req, nil)
 }
 
 func (c *ChatService) ChatStream(ctx context.Context, ownerKey string, req models.ChatRequest, onToken func(string)) (models.ChatResponse, error) {
 	conversationID := strings.TrimSpace(req.ConversationID)
+	header := c.buildInterpretationHeader(req, conversationID)
+	streamedHeader := false
+	onTokenWrapped := onToken
+	if onToken != nil && strings.TrimSpace(header) != "" {
+		onTokenWrapped = func(tok string) {
+			if !streamedHeader {
+				streamedHeader = true
+				onToken(header + "\n" + tok)
+				return
+			}
+			onToken(tok)
+		}
+	}
 	if conversationID != "" {
 		c.ensureConversationStateHydrated(ctx, ownerKey, conversationID)
 		_ = c.Store.AppendMessage(ctx, ownerKey, conversationID, "user", req.Message)
@@ -4264,6 +7904,11 @@ func (c *ChatService) ChatStream(ctx context.Context, ownerKey string, req model
 	if conversationID != "" {
 		st := c.getConversationState(conversationID)
 		if st != nil && st.PendingHandler == "deviceTelemetry" {
+			// Pending telemetry should not hijack unrelated analytical queries.
+			msgLower := strings.ToLower(req.Message)
+			if strings.Contains(msgLower, "analytic") || strings.Contains(msgLower, "pop") || strings.Contains(msgLower, "stat") || strings.Contains(msgLower, "poster") {
+				c.clearPending(conversationID)
+			} else {
 			hostTokens := detectHostTokens(req.Message)
 			shouldResolve := false
 			if len(hostTokens) == 0 {
@@ -4295,57 +7940,151 @@ func (c *ChatService) ChatStream(ctx context.Context, ownerKey string, req model
 				}
 				c.clearPending(conversationID)
 				answer := "I couldn't find a device matching that name. Please reply with the host/server id (for example: moco-brt-briggs-001)."
-				if onToken != nil {
-					onToken(answer)
+				answer = prefixIfNeeded(header, answer)
+				if onTokenWrapped != nil {
+					onTokenWrapped(answer)
 				}
 				return models.ChatResponse{Answer: answer}, nil
+			}
 			}
 		}
 	}
 
-	if resp, handled, err := c.handleTopPostersFromCity(ctx, req, onToken); handled {
+	if resp, handled, err := c.handleTopPostersFromCity(ctx, req, onTokenWrapped); handled {
+		resp.Answer = prefixIfNeeded(header, resp.Answer)
 		if conversationID != "" {
 			_ = c.Store.AppendMessage(ctx, ownerKey, conversationID, "assistant", resp.Answer)
 		}
 		return resp, err
 	}
-	if resp, handled, err := c.handleTopDevicesFromCity(ctx, req, onToken); handled {
+	if resp, handled, err := c.handleTopDevicesFromCity(ctx, req, onTokenWrapped); handled {
+		resp.Answer = prefixIfNeeded(header, resp.Answer)
 		if conversationID != "" {
 			_ = c.Store.AppendMessage(ctx, ownerKey, conversationID, "assistant", resp.Answer)
 		}
 		return resp, err
 	}
-	if resp, handled, err := c.handleKioskCountFromCity(ctx, req, onToken); handled {
+	if resp, handled, err := c.handlePosterAnalyticsByID(ctx, req, onTokenWrapped); handled {
+		resp.Answer = prefixIfNeeded(header, resp.Answer)
 		if conversationID != "" {
 			_ = c.Store.AppendMessage(ctx, ownerKey, conversationID, "assistant", resp.Answer)
 		}
 		return resp, err
 	}
-	if resp, handled, err := c.handlePopTodayByHost(ctx, req, onToken); handled {
+	if resp, handled, err := c.handlePosterMonthData(ctx, req, onTokenWrapped); handled {
+		resp.Answer = prefixIfNeeded(header, resp.Answer)
 		if conversationID != "" {
 			_ = c.Store.AppendMessage(ctx, ownerKey, conversationID, "assistant", resp.Answer)
 		}
 		return resp, err
 	}
-	if resp, handled, err := c.handleMetricsTodayByLocation(ctx, req, onToken); handled {
+	if resp, handled, err := c.handlePosterPlayCount(ctx, req, onTokenWrapped); handled {
+		resp.Answer = prefixIfNeeded(header, resp.Answer)
 		if conversationID != "" {
 			_ = c.Store.AppendMessage(ctx, ownerKey, conversationID, "assistant", resp.Answer)
 		}
 		return resp, err
 	}
-	if resp, handled, err := c.handleDeviceTelemetry(ctx, req, onToken); handled {
+	if resp, handled, err := c.handlePopForPosterID(ctx, req, onTokenWrapped); handled {
+		resp.Answer = prefixIfNeeded(header, resp.Answer)
+		if conversationID != "" {
+			_ = c.Store.AppendMessage(ctx, ownerKey, conversationID, "assistant", resp.Answer)
+		}
+		return resp, err
+	}
+	if resp, handled, err := c.handleKioskPosterPlayCount(ctx, req, onTokenWrapped); handled {
+		resp.Answer = prefixIfNeeded(header, resp.Answer)
+		if conversationID != "" {
+			_ = c.Store.AppendMessage(ctx, ownerKey, conversationID, "assistant", resp.Answer)
+		}
+		return resp, err
+	}
+	if resp, handled, err := c.handleKioskCountFromCity(ctx, req, onTokenWrapped); handled {
+		resp.Answer = prefixIfNeeded(header, resp.Answer)
+		if conversationID != "" {
+			_ = c.Store.AppendMessage(ctx, ownerKey, conversationID, "assistant", resp.Answer)
+		}
+		return resp, err
+	}
+	if resp, handled, err := c.handlePopYesterdayByHost(ctx, req, onTokenWrapped); handled {
+		resp.Answer = prefixIfNeeded(header, resp.Answer)
+		if conversationID != "" {
+			_ = c.Store.AppendMessage(ctx, ownerKey, conversationID, "assistant", resp.Answer)
+		}
+		return resp, err
+	}
+	if resp, handled, err := c.handlePopTodayByHost(ctx, req, onTokenWrapped); handled {
+		resp.Answer = prefixIfNeeded(header, resp.Answer)
+		if conversationID != "" {
+			_ = c.Store.AppendMessage(ctx, ownerKey, conversationID, "assistant", resp.Answer)
+		}
+		return resp, err
+	}
+	if resp, handled, err := c.handlePopStatsGeneric(ctx, req, onTokenWrapped); handled {
+		resp.Answer = prefixIfNeeded(header, resp.Answer)
+		if conversationID != "" {
+			_ = c.Store.AppendMessage(ctx, ownerKey, conversationID, "assistant", resp.Answer)
+		}
+		return resp, err
+	}
+	if resp, handled, err := c.handleVenueDevices(ctx, req, onTokenWrapped); handled {
+		resp.Answer = prefixIfNeeded(header, resp.Answer)
+		if conversationID != "" {
+			_ = c.Store.AppendMessage(ctx, ownerKey, conversationID, "assistant", resp.Answer)
+		}
+		return resp, err
+	}
+	if resp, handled, err := c.handleDeviceVenues(ctx, req, onTokenWrapped); handled {
+		resp.Answer = prefixIfNeeded(header, resp.Answer)
+		if conversationID != "" {
+			_ = c.Store.AppendMessage(ctx, ownerKey, conversationID, "assistant", resp.Answer)
+		}
+		return resp, err
+	}
+	if resp, handled, err := c.handleVenueSearchList(ctx, req, onTokenWrapped); handled {
+		resp.Answer = prefixIfNeeded(header, resp.Answer)
+		if conversationID != "" {
+			_ = c.Store.AppendMessage(ctx, ownerKey, conversationID, "assistant", resp.Answer)
+		}
+		return resp, err
+	}
+	if resp, handled, err := c.handleLowUptimeDevices(ctx, req, onTokenWrapped); handled {
+		resp.Answer = prefixIfNeeded(header, resp.Answer)
+		if conversationID != "" {
+			_ = c.Store.AppendMessage(ctx, ownerKey, conversationID, "assistant", resp.Answer)
+		}
+		return resp, err
+	}
+	if resp, handled, err := c.handleDeviceDetails(ctx, req, onTokenWrapped); handled {
+		resp.Answer = prefixIfNeeded(header, resp.Answer)
+		if conversationID != "" {
+			_ = c.Store.AppendMessage(ctx, ownerKey, conversationID, "assistant", resp.Answer)
+		}
+		return resp, err
+	}
+	if resp, handled, err := c.handleDeviceTelemetry(ctx, req, onTokenWrapped); handled {
+		resp.Answer = prefixIfNeeded(header, resp.Answer)
+		if conversationID != "" {
+			_ = c.Store.AppendMessage(ctx, ownerKey, conversationID, "assistant", resp.Answer)
+		}
+		return resp, err
+	}
+	if resp, handled, err := c.handleCampaignCreatives(ctx, req, onTokenWrapped); handled {
+		resp.Answer = prefixIfNeeded(header, resp.Answer)
 		if conversationID != "" {
 			_ = c.Store.AppendMessage(ctx, ownerKey, conversationID, "assistant", resp.Answer)
 		}
 		return resp, err
 	}
 	if resp, handled, err := c.handleCreativeUpload(ctx, ownerKey, req); handled {
+		resp.Answer = prefixIfNeeded(header, resp.Answer)
 		if conversationID != "" {
 			_ = c.Store.AppendMessage(ctx, ownerKey, conversationID, "assistant", resp.Answer)
 		}
 		return resp, err
 	}
-	if resp, handled, err := c.handlePosterDetails(ctx, req, onToken); handled {
+	if resp, handled, err := c.handlePosterDetails(ctx, req, onTokenWrapped); handled {
+		resp.Answer = prefixIfNeeded(header, resp.Answer)
 		if conversationID != "" {
 			_ = c.Store.AppendMessage(ctx, ownerKey, conversationID, "assistant", resp.Answer)
 		}
@@ -4359,13 +8098,14 @@ func (c *ChatService) ChatStream(ctx context.Context, ownerKey string, req model
 		if toolData != nil {
 			mockText += " I fetched impressions data."
 		}
+		mockText = prefixIfNeeded(header, mockText)
 		for i := 0; i < len(mockText); i += 20 {
 			end := i + 20
 			if end > len(mockText) {
 				end = len(mockText)
 			}
-			if onToken != nil {
-				onToken(mockText[i:end])
+			if onTokenWrapped != nil {
+				onTokenWrapped(mockText[i:end])
 			}
 		}
 		if conversationID != "" {
@@ -4506,13 +8246,14 @@ IMPORTANT: When receiving empty data from the API (where items is null or empty)
 	if err != nil {
 		return models.ChatResponse{}, err
 	}
+	full = prefixIfNeeded(header, full)
 	for i := 0; i < len(full); i += 20 {
 		end := i + 20
 		if end > len(full) {
 			end = len(full)
 		}
-		if onToken != nil {
-			onToken(full[i:end])
+		if onTokenWrapped != nil {
+			onTokenWrapped(full[i:end])
 		}
 	}
 	if conversationID != "" {
