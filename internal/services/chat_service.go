@@ -4974,10 +4974,20 @@ func (c *ChatService) handleKioskCountFromCity(ctx context.Context, req models.C
 	containsDeviceWord := strings.Contains(msgLower, "kiosk") || strings.Contains(msgLower, "kiosks") || strings.Contains(msgLower, "device") || strings.Contains(msgLower, "devices")
 	containsDataWord := strings.Contains(msgLower, " data") || strings.Contains(msgLower, "data ")
 
+	// If the user gave an explicit host and asked for device telemetry/health/metrics,
+	// let the per-host telemetry handler answer instead of returning city/region summaries.
+	hostTokens := detectHostTokens(req.Message)
+	if len(hostTokens) > 0 {
+		if strings.Contains(msgLower, "telemetry") || strings.Contains(msgLower, "health") || strings.Contains(msgLower, "metrics") || strings.Contains(msgLower, "device status") ||
+			strings.Contains(msgLower, "cpu") || strings.Contains(msgLower, "memory") || strings.Contains(msgLower, "ram") || strings.Contains(msgLower, "disk") || strings.Contains(msgLower, "storage") ||
+			strings.Contains(msgLower, "temperature") || strings.Contains(msgLower, "temp") || strings.Contains(msgLower, "uptime") {
+			return models.ChatResponse{}, false, nil
+		}
+	}
+
 	// Host-specific "data usage" questions (e.g. "how much internet data <host> is using") should be
 	// handled by the per-host telemetry handler, not city/region status.
 	if containsDataWord {
-		hostTokens := detectHostTokens(req.Message)
 		if len(hostTokens) > 0 {
 			if strings.Contains(msgLower, "internet") || strings.Contains(msgLower, "bandwidth") || strings.Contains(msgLower, "traffic") ||
 				strings.Contains(msgLower, "throughput") || strings.Contains(msgLower, "usage") || strings.Contains(msgLower, "using") ||
@@ -5191,6 +5201,391 @@ func (c *ChatService) handleKioskCountFromCity(ctx context.Context, req models.C
 		}
 	}
 
+	if onToken != nil {
+		onToken(answer)
+	}
+	return models.ChatResponse{Answer: answer, Steps: []models.Step{step}}, true, nil
+}
+
+func (c *ChatService) handleMetricsLatestByLocationDetails(ctx context.Context, req models.ChatRequest, onToken func(string)) (models.ChatResponse, bool, error) {
+	msgLower := strings.ToLower(req.Message)
+	contains := func(tokens ...string) bool {
+		for _, t := range tokens {
+			if strings.Contains(msgLower, t) {
+				return true
+			}
+		}
+		return false
+	}
+	// Kiosk-wise follow-ups like "kiosk wise" or "split" should return a per-kiosk table.
+	isKioskWise := (contains("kiosk") || contains("kiosks")) && (contains("wise") || contains("split") || contains("registered"))
+	if !contains("metric", "metrics") {
+		return models.ChatResponse{}, false, nil
+	}
+	// Only handle location-wide metrics when the user asks for concrete metrics (cpu/memory/etc)
+	// and does not provide a specific host.
+	if len(detectHostTokens(req.Message)) > 0 {
+		return models.ChatResponse{}, false, nil
+	}
+	if !(contains("cpu", "ram", "memory", "disk", "storage", "temperature", "network", "bandwidth", "uptime")) {
+		return models.ChatResponse{}, false, nil
+	}
+	if !(contains("city", "region") || contains("kiosk", "kiosks", "device", "devices")) {
+		return models.ChatResponse{}, false, nil
+	}
+
+	conversationID := strings.TrimSpace(req.ConversationID)
+	cityRaw := c.detectCityCode(ctx, msgLower)
+	region := c.detectRegionCode(ctx, msgLower)
+	city, _ := normalizeCitySelection(cityRaw, region, msgLower)
+	if city == "" && region == "" && conversationID != "" {
+		if st := c.getConversationState(conversationID); st != nil {
+			city = strings.ToLower(strings.TrimSpace(st.City))
+			region = strings.ToLower(strings.TrimSpace(st.Region))
+		}
+	}
+	if city == "" && region == "" {
+		return models.ChatResponse{Answer: "Please specify a city and/or region (for example: moco city brt region)."}, true, nil
+	}
+	if conversationID != "" {
+		c.updateConversationLocation(conversationID, city, region)
+		c.clearPending(conversationID)
+	}
+	if c.Gateway == nil {
+		return models.ChatResponse{Answer: "Tool gateway is not configured."}, true, nil
+	}
+
+	filterCity := strings.ToLower(strings.TrimSpace(city))
+	filterRegion := strings.ToLower(strings.TrimSpace(region))
+
+	type rowMetric struct {
+		ServerID         string  `json:"server_id"`
+		Time             string  `json:"time"`
+		CPU              float64 `json:"cpu"`
+		Memory           float64 `json:"memory"`
+		Disk             float64 `json:"disk"`
+		Temperature      float64 `json:"temperature"`
+		PowerOnline      bool    `json:"power_online"`
+		City             string  `json:"city"`
+		Region           string  `json:"region"`
+		UptimeSeconds    int64   `json:"uptime"`
+		MemoryTotalBytes int64   `json:"memory_total_bytes"`
+		MemoryUsedBytes  int64   `json:"memory_used_bytes"`
+		DiskTotalBytes   int64   `json:"disk_total_bytes"`
+		DiskUsedBytes    int64   `json:"disk_used_bytes"`
+	}
+
+	rows := make([]rowMetric, 0, 64)
+	steps := make([]models.Step, 0, 3)
+	page := 1
+	pageSize := 200
+	maxPages := 5
+	for {
+		path := fmt.Sprintf("/metrics/latest?page=%d&page_size=%d&include_totals=false", page, pageSize)
+		status, body, err := c.Gateway.Get(path)
+		step := models.Step{Tool: "metricsLatest", Status: status}
+		if err != nil {
+			step.Error = err.Error()
+		} else {
+			step.Body = clipString(strings.TrimSpace(string(body)), 2000)
+		}
+		steps = append(steps, step)
+
+		if err != nil {
+			return models.ChatResponse{Answer: "Failed to fetch latest metrics: " + err.Error(), Steps: steps}, true, nil
+		}
+		if status < 200 || status >= 300 {
+			return models.ChatResponse{Answer: fmt.Sprintf("Failed to fetch latest metrics (status %d).", status), Steps: steps}, true, nil
+		}
+		var payload struct {
+			Data       []rowMetric `json:"data"`
+			Pagination struct {
+				HasMore bool `json:"has_more"`
+			} `json:"pagination"`
+		}
+		if json.Unmarshal(body, &payload) != nil {
+			return models.ChatResponse{Answer: "Latest metrics response could not be parsed.", Steps: steps}, true, nil
+		}
+		for _, r := range payload.Data {
+			rowCity := strings.ToLower(strings.TrimSpace(r.City))
+			rowRegion := strings.ToLower(strings.TrimSpace(r.Region))
+			if filterCity != "" && rowCity != filterCity {
+				continue
+			}
+			if filterRegion != "" && rowRegion != filterRegion {
+				continue
+			}
+			if strings.TrimSpace(r.ServerID) == "" {
+				continue
+			}
+			rows = append(rows, r)
+		}
+		if !payload.Pagination.HasMore {
+			break
+		}
+		page++
+		if page > maxPages {
+			break
+		}
+	}
+
+	if len(rows) == 0 {
+		scope := "the requested scope"
+		if filterRegion != "" {
+			scope = fmt.Sprintf("region '%s'", filterRegion)
+		} else if filterCity != "" {
+			scope = fmt.Sprintf("city '%s'", filterCity)
+		}
+		return models.ChatResponse{Answer: fmt.Sprintf("No latest metrics were found for %s.", scope), Steps: steps}, true, nil
+	}
+
+	now := time.Now().UTC()
+	online := 0
+	var cpuSum, memSum, diskSum, tempSum float64
+	latestTime := ""
+	for _, r := range rows {
+		// The `power_online` field appears unreliable in some deployments (often false for all rows).
+		// Treat a device as online if it reported within the last 5 minutes.
+		if t, err := time.Parse(time.RFC3339, strings.TrimSpace(r.Time)); err == nil {
+			if now.Sub(t) <= 5*time.Minute {
+				online++
+			}
+		}
+		cpuSum += r.CPU
+		memSum += r.Memory
+		diskSum += r.Disk
+		tempSum += r.Temperature
+		if r.Time != "" {
+			// Keep the max lexicographically; RFC3339 sorts lexicographically.
+			if latestTime == "" || r.Time > latestTime {
+				latestTime = r.Time
+			}
+		}
+	}
+	count := len(rows)
+	avgCPU := cpuSum / float64(count)
+	avgMem := memSum / float64(count)
+	avgDisk := diskSum / float64(count)
+	avgTemp := tempSum / float64(count)
+
+	// Top offenders
+	type ranked struct {
+		ID  string
+		Val float64
+	}
+	topN := func(get func(rowMetric) float64, n int) []ranked {
+		out := make([]ranked, 0, len(rows))
+		for _, r := range rows {
+			out = append(out, ranked{ID: r.ServerID, Val: get(r)})
+		}
+		sort.Slice(out, func(i, j int) bool { return out[i].Val > out[j].Val })
+		if n > len(out) {
+			n = len(out)
+		}
+		return out[:n]
+	}
+
+	scopeLabel := ""
+	if filterRegion != "" {
+		scopeLabel = fmt.Sprintf("region '%s'", filterRegion)
+	} else {
+		scopeLabel = fmt.Sprintf("city '%s'", filterCity)
+	}
+
+	lines := make([]string, 0, 30)
+	lines = append(lines, fmt.Sprintf("Latest metrics for %s: %d devices (%d online). Avg CPU %.1f%%, memory %.1f%%, disk %.1f%%, temp %.1f°C.%s",
+		scopeLabel, count, online, avgCPU, avgMem, avgDisk, avgTemp,
+		func() string {
+			if latestTime == "" {
+				return ""
+			}
+			return " (latest " + latestTime + ")"
+		}(),
+	))
+
+	if isKioskWise {
+		// Show a per-kiosk table. Sort by the most relevant metric requested.
+		sortMetric := func(r rowMetric) float64 {
+			if contains("cpu") {
+				return r.CPU
+			}
+			if contains("memory") || contains("ram") {
+				return r.Memory
+			}
+			if contains("disk") || contains("storage") {
+				return r.Disk
+			}
+			if contains("temp") || contains("temperature") {
+				return r.Temperature
+			}
+			// Default: CPU.
+			return r.CPU
+		}
+		sorted := make([]rowMetric, 0, len(rows))
+		sorted = append(sorted, rows...)
+		sort.Slice(sorted, func(i, j int) bool { return sortMetric(sorted[i]) > sortMetric(sorted[j]) })
+		limit := 10
+		lines = append(lines, "Kiosk-wise:")
+		for i, r := range sorted {
+			if i >= limit {
+				break
+			}
+			lines = append(lines, fmt.Sprintf("%d. %s — CPU %.1f%% | Mem %.1f%% | Disk %.1f%% | Temp %.1f°C",
+				i+1, r.ServerID, r.CPU, r.Memory, r.Disk, r.Temperature,
+			))
+		}
+		answer := strings.Join(lines, "\n")
+		if onToken != nil {
+			onToken(answer)
+		}
+		return models.ChatResponse{Answer: answer, Steps: steps}, true, nil
+	}
+	if contains("cpu") {
+		cpuTop := topN(func(r rowMetric) float64 { return r.CPU }, 5)
+		lines = append(lines, "Top CPU:")
+		for i, it := range cpuTop {
+			lines = append(lines, fmt.Sprintf("%d. %s — %.1f%%", i+1, it.ID, it.Val))
+		}
+	}
+	if contains("memory") || contains("ram") {
+		memTop := topN(func(r rowMetric) float64 { return r.Memory }, 5)
+		lines = append(lines, "Top memory:")
+		for i, it := range memTop {
+			lines = append(lines, fmt.Sprintf("%d. %s — %.1f%%", i+1, it.ID, it.Val))
+		}
+	}
+	if contains("disk") || contains("storage") {
+		diskTop := topN(func(r rowMetric) float64 { return r.Disk }, 5)
+		lines = append(lines, "Top disk:")
+		for i, it := range diskTop {
+			lines = append(lines, fmt.Sprintf("%d. %s — %.1f%%", i+1, it.ID, it.Val))
+		}
+	}
+	answer := strings.Join(lines, "\n")
+	if onToken != nil {
+		onToken(answer)
+	}
+	return models.ChatResponse{Answer: answer, Steps: steps}, true, nil
+}
+
+func (c *ChatService) handlePopKioskWiseFollowup(ctx context.Context, req models.ChatRequest, onToken func(string)) (models.ChatResponse, bool, error) {
+	msg := strings.TrimSpace(req.Message)
+	msgLower := strings.ToLower(msg)
+	if msg == "" {
+		return models.ChatResponse{}, false, nil
+	}
+	// This handler is specifically for location-scoped POP/analytics follow-ups that ask for kiosk-wise breakdown
+	// but do not specify a host.
+	if len(detectHostTokens(msg)) > 0 {
+		return models.ChatResponse{}, false, nil
+	}
+	if !(strings.Contains(msgLower, "kiosk") || strings.Contains(msgLower, "kiosks")) {
+		return models.ChatResponse{}, false, nil
+	}
+	if !(strings.Contains(msgLower, "wise") || strings.Contains(msgLower, "split") || strings.Contains(msgLower, "registered")) {
+		return models.ChatResponse{}, false, nil
+	}
+	// Avoid taking over explicit telemetry requests.
+	if strings.Contains(msgLower, "telemetry") || strings.Contains(msgLower, "device status") || strings.Contains(msgLower, "health") || strings.Contains(msgLower, "metrics") {
+		return models.ChatResponse{}, false, nil
+	}
+	conversationID := strings.TrimSpace(req.ConversationID)
+	city := c.detectCityCode(ctx, msgLower)
+	region := c.detectRegionCode(ctx, msgLower)
+	if city == "" && region == "" && conversationID != "" {
+		if st := c.getConversationState(conversationID); st != nil {
+			city = strings.ToLower(strings.TrimSpace(st.City))
+			region = strings.ToLower(strings.TrimSpace(st.Region))
+		}
+	}
+	if city == "" && region == "" {
+		return models.ChatResponse{Answer: "Please specify a city or region code (for example: moco city brt region)."}, true, nil
+	}
+	if conversationID != "" {
+		c.updateConversationLocation(conversationID, city, region)
+		c.clearPending(conversationID)
+	}
+	if c.Gateway == nil {
+		return models.ChatResponse{Answer: "Tool gateway is not configured."}, true, nil
+	}
+
+	metric := "clicks"
+	if strings.Contains(msgLower, "play") {
+		metric = "plays"
+	}
+	limit := 10
+	path := fmt.Sprintf("/pop/stats?group_by=kiosk&metric=%s&order=top&limit=%d", metric, limit)
+	// Follow-up UX: if user didn't specify an explicit window, default to last 7 days.
+	now := time.Now().UTC()
+	from := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC).AddDate(0, 0, -7)
+	to := now
+	if strings.Contains(msgLower, "today") {
+		from = time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
+	}
+	if strings.Contains(msgLower, "yesterday") {
+		from = time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC).AddDate(0, 0, -1)
+		to = time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
+	}
+	// If the user explicitly asked for "last week", keep the same default (7 days), but make intent explicit.
+	path += "&from=" + urlEscape(from.Format(time.RFC3339)) + "&to=" + urlEscape(to.Format(time.RFC3339))
+	if region != "" {
+		path += "&region=" + urlEscape(region)
+	} else {
+		path += "&city=" + urlEscape(city)
+	}
+
+	status, body, err := c.Gateway.Get(path)
+	step := models.Step{Tool: "popStats", Status: status}
+	if err != nil {
+		step.Error = err.Error()
+	} else {
+		step.Body = clipString(strings.TrimSpace(string(body)), 2000)
+	}
+	if err != nil {
+		return models.ChatResponse{Answer: "Failed to fetch POP stats: " + err.Error(), Steps: []models.Step{step}}, true, nil
+	}
+	if status < 200 || status >= 300 {
+		return models.ChatResponse{Answer: fmt.Sprintf("Failed to fetch POP stats (status %d).", status), Steps: []models.Step{step}}, true, nil
+	}
+	var parsed struct {
+		Items []map[string]any `json:"items"`
+	}
+	if json.Unmarshal(body, &parsed) != nil {
+		return models.ChatResponse{Answer: "POP stats response could not be parsed.", Steps: []models.Step{step}}, true, nil
+	}
+	if len(parsed.Items) == 0 {
+		return models.ChatResponse{Answer: "No kiosk stats found for that scope.", Steps: []models.Step{step}}, true, nil
+	}
+	lines := make([]string, 0, 11)
+	scopeLabel := ""
+	if region != "" {
+		scopeLabel = fmt.Sprintf("region '%s'", region)
+	} else {
+		scopeLabel = fmt.Sprintf("city '%s'", city)
+	}
+	lines = append(lines, fmt.Sprintf("Top kiosks in %s by %s (last 7 days):", scopeLabel, metric))
+	for _, row := range parsed.Items {
+		if len(lines)-1 >= limit {
+			break
+		}
+		k, _ := row["Key"].(string)
+		if strings.TrimSpace(k) == "" {
+			continue
+		}
+		val := 0.0
+		switch v := row["Metric"].(type) {
+		case float64:
+			val = v
+		case int:
+			val = float64(v)
+		case json.Number:
+			if f, e := v.Float64(); e == nil {
+				val = f
+			}
+		}
+		lines = append(lines, fmt.Sprintf("%d. %s — %.0f %s", len(lines), k, val, metric))
+	}
+	answer := strings.Join(lines, "\n")
 	if onToken != nil {
 		onToken(answer)
 	}
@@ -6314,42 +6709,39 @@ func (c *ChatService) buildInterpretationHeader(req models.ChatRequest, conversa
 		}
 		return cand
 	}
-	getNextToken := func(tokens []string, idx int) string {
-		if idx < 0 || idx+1 >= len(tokens) {
-			return ""
-		}
-		cand := strings.TrimSpace(tokens[idx+1])
-		cand = strings.Trim(cand, "\"'.,;:()[]{}")
-		candLower := strings.ToLower(cand)
-		switch candLower {
-		case "from", "in", "the", "a", "an", "of", "for", "on", "at", "to", "with":
-			return ""
-		}
-		return cand
-	}
 	words := strings.Fields(msgLower)
 	region := ""
 	city := ""
 	for i, w := range words {
 		wl := strings.ToLower(strings.Trim(w, "\"'.,;:()[]{}"))
 		if region == "" && wl == "region" {
-			region = getPrevToken(words, i)
-			if region == "" {
-				region = getNextToken(words, i)
+			cand := strings.ToLower(strings.TrimSpace(getPrevToken(words, i)))
+			switch cand {
+			case "", "this", "that", "these", "those":
+				// Ignore pronoun-based phrases like "this region".
+			default:
+				region = cand
 			}
 		}
 		if city == "" && wl == "city" {
-			city = getPrevToken(words, i)
-			if city == "" {
-				city = getNextToken(words, i)
+			cand := strings.ToLower(strings.TrimSpace(getPrevToken(words, i)))
+			switch cand {
+			case "", "this", "that", "these", "those":
+				// Ignore pronoun-based phrases like "this city".
+			default:
+				city = cand
 			}
 		}
 	}
+	// Fallback: "region <code>" style.
 	if region == "" {
 		region2 := strings.TrimSpace(extractAfterKeyword(msgLower, "region"))
 		if region2 != "" {
 			if f := strings.Fields(region2); len(f) > 0 {
-				region = strings.Trim(f[0], "\"'.,;:()[]{}")
+				cand := strings.ToLower(strings.Trim(strings.TrimSpace(f[0]), "\"'.,;:()[]{}"))
+				if cand != "this" && cand != "that" && cand != "these" && cand != "those" {
+					region = cand
+				}
 			}
 		}
 	}
@@ -6357,7 +6749,10 @@ func (c *ChatService) buildInterpretationHeader(req models.ChatRequest, conversa
 		city2 := strings.TrimSpace(extractAfterKeyword(msgLower, "city"))
 		if city2 != "" {
 			if f := strings.Fields(city2); len(f) > 0 {
-				city = strings.Trim(f[0], "\"'.,;:()[]{}")
+				cand := strings.ToLower(strings.Trim(strings.TrimSpace(f[0]), "\"'.,;:()[]{}"))
+				if cand != "this" && cand != "that" && cand != "these" && cand != "those" {
+					city = cand
+				}
 			}
 		}
 	}
@@ -6848,6 +7243,14 @@ func (c *ChatService) handleTopPostersFromCity(ctx context.Context, req models.C
 		limit = n
 	}
 	path := "/pop/stats?group_by=poster&metric=" + metric + "&order=top&limit=" + fmt.Sprintf("%d", limit)
+	// Basic relative time window support.
+	// If the user asked for "last week", apply from/to to scope the POP stats query.
+	if strings.Contains(msgLower, "last week") || strings.Contains(msgLower, "past week") {
+		now := time.Now().UTC()
+		from := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC).AddDate(0, 0, -7)
+		to := now
+		path += "&from=" + urlEscape(from.Format(time.RFC3339)) + "&to=" + urlEscape(to.Format(time.RFC3339))
+	}
 	scopeLabel := ""
 	if region != "" {
 		path += "&region=" + urlEscape(region)
@@ -7906,7 +8309,10 @@ func (c *ChatService) ChatStream(ctx context.Context, ownerKey string, req model
 		if st != nil && st.PendingHandler == "deviceTelemetry" {
 			// Pending telemetry should not hijack unrelated analytical queries.
 			msgLower := strings.ToLower(req.Message)
-			if strings.Contains(msgLower, "analytic") || strings.Contains(msgLower, "pop") || strings.Contains(msgLower, "stat") || strings.Contains(msgLower, "poster") {
+			isAnalytics := strings.Contains(msgLower, "analytic") || strings.Contains(msgLower, "pop") || strings.Contains(msgLower, "stat") || strings.Contains(msgLower, "poster")
+			isKioskWise := (strings.Contains(msgLower, "kiosk") || strings.Contains(msgLower, "kiosks")) && (strings.Contains(msgLower, "wise") || strings.Contains(msgLower, "split") || strings.Contains(msgLower, "registered"))
+			mentionsScope := strings.Contains(msgLower, " city") || strings.Contains(msgLower, " region") || strings.Contains(msgLower, " in ") || strings.Contains(msgLower, " from ")
+			if isAnalytics || isKioskWise || mentionsScope {
 				c.clearPending(conversationID)
 			} else {
 			hostTokens := detectHostTokens(req.Message)
@@ -7957,6 +8363,13 @@ func (c *ChatService) ChatStream(ctx context.Context, ownerKey string, req model
 		}
 		return resp, err
 	}
+	if resp, handled, err := c.handlePopKioskWiseFollowup(ctx, req, onTokenWrapped); handled {
+		resp.Answer = prefixIfNeeded(header, resp.Answer)
+		if conversationID != "" {
+			_ = c.Store.AppendMessage(ctx, ownerKey, conversationID, "assistant", resp.Answer)
+		}
+		return resp, err
+	}
 	if resp, handled, err := c.handleTopDevicesFromCity(ctx, req, onTokenWrapped); handled {
 		resp.Answer = prefixIfNeeded(header, resp.Answer)
 		if conversationID != "" {
@@ -7993,6 +8406,13 @@ func (c *ChatService) ChatStream(ctx context.Context, ownerKey string, req model
 		return resp, err
 	}
 	if resp, handled, err := c.handleKioskPosterPlayCount(ctx, req, onTokenWrapped); handled {
+		resp.Answer = prefixIfNeeded(header, resp.Answer)
+		if conversationID != "" {
+			_ = c.Store.AppendMessage(ctx, ownerKey, conversationID, "assistant", resp.Answer)
+		}
+		return resp, err
+	}
+	if resp, handled, err := c.handleMetricsLatestByLocationDetails(ctx, req, onTokenWrapped); handled {
 		resp.Answer = prefixIfNeeded(header, resp.Answer)
 		if conversationID != "" {
 			_ = c.Store.AppendMessage(ctx, ownerKey, conversationID, "assistant", resp.Answer)
